@@ -5,11 +5,13 @@ use crate::GuardLayer;
 use crate::body::{BoxError, GuardBody};
 use crate::response;
 use bytes::{Bytes, BytesMut};
-use guard_core_engine::body_scan::extract_body_scan_values;
-use guard_core_engine::detect::Threat;
-use guard_core_engine::ip_ban::RATE_LIMIT_CATEGORY;
+use guard_core_engine::detection_exclusions::{
+    RequestSurfaces, RouteDetectionExclusions, resolve as resolve_exclusions,
+};
 use guard_core_engine::ip_gate::IpGateDecision;
 use guard_core_engine::ip_gate::IpGateVerdict;
+use guard_core_rs::responses::{build_block_payload, fire_block_hook, resolve_error_body};
+use guard_core_rs::tower::{RequestObservation, RouteRateLimits};
 use http::header::CONTENT_TYPE;
 use http::request::Parts;
 use http::{Request, Response};
@@ -89,10 +91,10 @@ enum BufferFailure {
 pub(crate) enum ScanOutcome {
     /// No view tripped the engine.
     Clean,
-    /// At least one view was flagged as a threat; the detection categories
-    /// of the first flagged view, deduplicated and sorted (the auto-ban
-    /// engine counts them per client IP).
-    Threat(Vec<String>),
+    /// The engine's multi-surface verdict for the first flagged view: the
+    /// contributing categories (deduplicated, sorted - the auto-ban engine
+    /// counts them per client IP) and the reference reason line.
+    Threat(guard_core_engine::detection_exclusions::RequestScanVerdict),
     /// The engine panicked; fail secure.
     Failed,
 }
@@ -115,7 +117,7 @@ where
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
-        let mut inner = self.inner.clone();
+        let inner = self.inner.clone();
         let layer = self.layer.clone();
         Box::pin(async move {
             let (mut parts, mut body) = request.into_parts();
@@ -124,13 +126,6 @@ where
             // cost a body buffer, and detection still scans whatever passes.
             if let Some(denial) = enforce_ip_gate(&mut parts, &layer) {
                 return Ok(denial.map(GuardBody::Generated));
-            }
-
-            // The stateful stage (dynamic bans, then rate limiting) runs on
-            // every attributed, non-exempt request before a body buffer is
-            // spent on it.
-            if let Some(blocked) = enforce_state_stage(&parts, &layer) {
-                return Ok(blocked.map(GuardBody::Generated));
             }
 
             let buffered = match buffer_body(&mut body, layer.body_cap()).await {
@@ -142,19 +137,126 @@ where
                     return Ok(response::failure().map(GuardBody::Generated));
                 }
             };
-            match scan_request(&parts, buffered.as_ref(), &layer) {
-                ScanOutcome::Clean => {
-                    let rebuilt = B::from(buffered.unwrap_or_default());
-                    let response = inner.call(Request::from_parts(parts, rebuilt)).await?;
-                    Ok(response.map(GuardBody::Passthrough))
-                }
-                ScanOutcome::Threat(categories) => {
-                    Ok(detect_block(&parts, &layer, &categories).map(GuardBody::Generated))
-                }
-                ScanOutcome::Failed => Ok(response::failure().map(GuardBody::Generated)),
+            let verdict = match scan_request(&parts, buffered.as_ref(), &layer) {
+                ScanOutcome::Clean => None,
+                ScanOutcome::Failed => return Ok(response::failure().map(GuardBody::Generated)),
+                ScanOutcome::Threat(verdict) => Some(verdict),
+            };
+
+            // One engine-stage pass decides for every request: bans first
+            // (403 `IP address banned`), then the rate-limit tiers
+            // (429 + `Retry-After`), then the detection feed (the auto-ban
+            // engine may answer `403 IP has been banned` on this very
+            // request) - the reference pipeline order: `ip_security` (ban
+            // check), `rate_limit`, `suspicious_activity`.
+            let stage = layer
+                .stage()
+                .expect("the stage is built by GuardLayer::layer");
+            let finding = verdict
+                .as_ref()
+                .map(|verdict| guard_core_rs::tower::ThreatFinding {
+                    is_threat: true,
+                    categories: verdict.categories.clone(),
+                    trigger_info: verdict.reason.clone(),
+                });
+            let observation = request_observation(&parts);
+            let decision = stage.decide_for_path_observed(
+                client_ip(&parts),
+                Some(parts.uri.path()),
+                parts.extensions.get::<RouteRateLimits>(),
+                parts.extensions.get::<IpGateDecision>().copied(),
+                finding.as_ref(),
+                Some(&observation),
+            );
+            if let Some(blocked) = decision {
+                return Ok(response::stage(&blocked).map(GuardBody::Generated));
             }
+            if let (Some(verdict), false) = (&verdict, stage.config().passive_mode) {
+                // Below-threshold detection (or an unattributed request):
+                // the plain family block shape. Under passive mode the
+                // detection was observed and counted by the stage and the
+                // request forwards (the reference's passive path renders
+                // no block).
+                return Ok(detection_block(&parts, &layer, verdict).map(GuardBody::Generated));
+            }
+            forward(parts, buffered, inner).await
         })
     }
+}
+
+/// Forward the buffered request to the wrapped service.
+async fn forward<S, B, B2>(
+    parts: Parts,
+    buffered: Option<Bytes>,
+    mut inner: S,
+) -> Result<Response<GuardBody<B2>>, S::Error>
+where
+    S: Service<Request<B>, Response = Response<B2>>,
+    B: Body<Data = Bytes> + From<Bytes>,
+{
+    let rebuilt = B::from(buffered.unwrap_or_default());
+    let response = inner.call(Request::from_parts(parts, rebuilt)).await?;
+    Ok(response.map(GuardBody::Passthrough))
+}
+
+/// The request's attributed client IP, when the stack provided one.
+fn client_ip(parts: &Parts) -> Option<std::net::IpAddr> {
+    parts.extensions.get::<GuardClientIp>().map(|ip| ip.0)
+}
+
+/// The request pieces the stage's event and log emissions read.
+fn request_observation(parts: &Parts) -> RequestObservation {
+    let mut url = parts.uri.path().to_owned();
+    if let Some(query) = parts.uri.query() {
+        url.push('?');
+        url.push_str(query);
+    }
+    RequestObservation {
+        method: Some(parts.method.as_str().to_owned()),
+        url: Some(url),
+        user_agent: parts
+            .headers
+            .get(http::header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+    }
+}
+
+/// The plain detection block for a flagged request whose violations did
+/// not cross a ban threshold (or that carried no client IP to attribute):
+/// the family's `400 Bad Request` (`Suspicious activity detected`), with
+/// the `custom_error_responses` body override and the reference `on_block`
+/// payload when the corresponding seams are installed.
+fn detection_block(
+    parts: &Parts,
+    layer: &GuardLayer,
+    verdict: &guard_core_engine::detection_exclusions::RequestScanVerdict,
+) -> Response<Full<Bytes>> {
+    let status = 400;
+    let body = resolve_error_body(
+        layer.custom_error_responses(),
+        status,
+        response::BLOCKED_MESSAGE,
+    );
+    if let Some(observability) = layer.observability() {
+        let ip = client_ip(parts)
+            .map(|ip| ip.to_string())
+            .unwrap_or_default();
+        let observation = request_observation(parts);
+        let payload = build_block_payload(
+            "suspicious_activity",
+            &format!("Suspicious activity detected: {ip}"),
+            &verdict.reason,
+            false,
+            &ip,
+            observation.url.as_deref().unwrap_or("/"),
+            observation.method.as_deref().unwrap_or(""),
+            Some(status),
+            &observability.sensitive,
+        );
+        fire_block_hook(layer.on_block(), &payload);
+    }
+    response::blocked_with_body(status, &body)
 }
 
 /// Apply the configured IP gate to the request parts.
@@ -176,84 +278,6 @@ fn enforce_ip_gate(parts: &mut Parts, layer: &GuardLayer) -> Option<Response<Ful
         }
         IpGateVerdict::Denied(_) => Some(response::forbidden()),
     }
-}
-
-/// The client IP, when the request is attributable and not skipped by the
-/// `exempt_ips` contract: the stateful stage's gate.
-///
-/// Unattributed requests cannot be banned, rate limited, or counted (the
-/// stage cannot tell who to hold responsible); whitelisted and exempt IPs
-/// skip exactly what the reference skips for a whitelist match. Detection
-/// applies to both, always.
-fn attributed_and_counting(parts: &Parts) -> Option<std::net::IpAddr> {
-    let GuardClientIp(ip) = parts.extensions.get::<GuardClientIp>()?;
-    let decision = parts
-        .extensions
-        .get::<IpGateDecision>()
-        .copied()
-        .unwrap_or_default();
-    if decision.is_whitelisted || decision.is_exempt {
-        return None;
-    }
-    Some(*ip)
-}
-
-/// The stateful stage: dynamic bans, then rate limiting, in the reference
-/// pipeline's order (an IP ban check precedes the rate limiter).
-///
-/// Returns the block response when the stage denies the request:
-/// `403 Forbidden` (`IP address banned`) for a live ban,
-/// `429 Too Many Requests` with `Retry-After: <window>` for a crossing.
-fn enforce_state_stage(parts: &Parts, layer: &GuardLayer) -> Option<Response<Full<Bytes>>> {
-    let ip = attributed_and_counting(parts)?;
-
-    // Ban check first: a banned IP is denied before its rate window is
-    // touched, so banned traffic neither consumes budget nor counts
-    // violations (the request never reaches the limiter).
-    if let Some(ban) = layer.ban_state()
-        && ban.config.enable_ip_banning
-        && ban.manager.is_banned(ip)
-    {
-        return Some(response::banned_ip());
-    }
-
-    let limiter = layer.rate_limiter()?;
-    let decision = limiter.check(ip, None);
-    if decision.allowed {
-        return None;
-    }
-    // Rate-limit autoban: every active crossing counts one `rate_limit`
-    // violation toward the auto-ban engine (the reference's
-    // `_record_rate_limit_autoban`). The response stays 429; the ban takes
-    // effect on the next request, which the ban stage answers with 403.
-    if limiter.config().enable_rate_limit_auto_ban
-        && let Some(ban) = layer.ban_state()
-    {
-        ban.register_violations(ip, &[RATE_LIMIT_CATEGORY], "rate_limit_exceeded");
-    }
-    Some(response::rate_limited(decision.retry_after()))
-}
-
-/// The detection block for one flagged request, with the auto-ban engine
-/// attached: the flagged view's categories count as violations for the
-/// client IP, and a crossed threshold bans on the spot (the reference
-/// pipeline's suspicious-activity stage). Banning configured and fired
-/// answers `IP has been banned`; everything else keeps the family's
-/// `Suspicious activity detected` block shape.
-fn detect_block(parts: &Parts, layer: &GuardLayer, categories: &[String]) -> Response<Full<Bytes>> {
-    // Counting is attribute-gated only: the engine's resolution refuses to
-    // ban while the config's enable_ip_banning is off, and the violations
-    // still count (enabling banning later starts from observed history).
-    if let (Some(ban), Some(ip)) = (layer.ban_state(), attributed_and_counting(parts)) {
-        let category_refs: Vec<&str> = categories.iter().map(String::as_str).collect();
-        if ban
-            .register_violations(ip, &category_refs, "penetration_attempt")
-            .is_some()
-        {
-            return response::activity_banned();
-        }
-    }
-    response::blocked()
 }
 
 /// Buffer a request body up to `cap` bytes.
@@ -289,133 +313,128 @@ where
 /// answer `500` instead of unwinding out of the request task.
 fn scan_request(parts: &Parts, body: Option<&Bytes>, layer: &GuardLayer) -> ScanOutcome {
     match catch_unwind(AssertUnwindSafe(|| scan_views(parts, body, layer))) {
-        Ok(ScanOutcome::Threat(categories)) => ScanOutcome::Threat(sort_categories(categories)),
         Ok(outcome) => outcome,
         Err(_) => ScanOutcome::Failed,
     }
 }
 
-/// Deduplicate and sort the flagged view's categories: the deterministic
-/// order the auto-ban engine resolves thresholds in (the Go port sorts too).
-fn sort_categories(mut categories: Vec<String>) -> Vec<String> {
-    categories.sort_unstable();
-    categories.dedup();
-    categories
-}
-
-/// One engine call per view, in the documented order: path, query, headers,
-/// body. The first view the engine flags wins, and its categories are the
-/// violation categories the auto-ban engine counts.
-fn scan_views(parts: &Parts, body: Option<&Bytes>, layer: &GuardLayer) -> ScanOutcome {
-    let path = parts.uri.path();
-    if path != "/"
-        && let Some(categories) = categories_for(layer, path, "url_path")
-    {
-        return ScanOutcome::Threat(categories);
-    }
-
-    if let Some(query) = parts.uri.query()
-        && !query.is_empty()
-        && let Some(categories) = categories_for(layer, query, "query_param")
-    {
-        return ScanOutcome::Threat(categories);
-    }
-
-    for (name, value) in &parts.headers {
-        if is_excluded_header(name.as_str()) {
-            continue;
-        }
-        // Opaque (non-ASCII) header values cannot be represented as `&str`.
-        // They are skipped rather than guessed at, mirroring the string-typed
-        // header maps the TypeScript adapters hand to the engine.
-        let Ok(value) = value.to_str() else {
-            continue;
-        };
-        if let Some(categories) = categories_for(layer, value, "header") {
-            return ScanOutcome::Threat(categories);
-        }
-    }
-
-    if let Some(bytes) = body {
-        // Content-type routing (urlencoded fields, multipart parts, JSON
-        // walks, blob fallback) happens in the engine; every extracted value
-        // is scanned with its reference context instead of the lossy
-        // whole-body blob.
-        let content_type = parts
-            .headers
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok());
-        if let Some(categories) = body_categories(layer, content_type, bytes) {
-            return ScanOutcome::Threat(categories);
-        }
-    }
-
-    ScanOutcome::Clean
-}
-
-/// Scan the buffered request body through the engine's body-value extraction
-/// (`request_body` view).
+/// One multi-surface engine pass over the request, in the reference scan
+/// order: URL path, query params, headers, body. The per-route
+/// detection-exclusion surface ([`RouteDetectionExclusions`] request
+/// extension resolving over the global config) merges and lowercases
+/// through the engine's `resolve`, and [`scan_surfaces`] applies the
+/// reference semantics exactly: excluded query params and body fields are
+/// skipped, excluded headers scan with their known-false-positive
+/// categories suppressed (address-carrying proxy headers lose only
+/// `ssrf`, and only for address-chain values), the enabled-categories set
+/// filters per value (a threat whose categories are all filtered out ends
+/// the scan clean - terminal, not a reason to keep scanning), and
+/// `detection_scan_body = false` skips the body surface entirely.
 ///
-/// Every extracted value goes through the normal detect path with the context
-/// label the reference engine scans it under (`request_body:form_field`,
-/// `request_body:multipart_field`, `:embedded_json` leaves, ...); the first
-/// threat wins. A value with a forced category (a JSON mongo operator key the
-/// reference reports straight from the JSON walk) is a threat outright. An
-/// empty (or whitespace-only) body is not scanned, mirroring the previous
-/// behavior.
-fn body_categories(
-    layer: &GuardLayer,
-    content_type: Option<&str>,
-    bytes: &[u8],
-) -> Option<Vec<String>> {
-    let text = String::from_utf8_lossy(bytes);
-    if text.trim().is_empty() {
-        return None;
-    }
-    for value in extract_body_scan_values(&text, content_type.unwrap_or(""), layer.config()) {
-        if let Some(forced) = value.forced_category {
-            return Some(vec![forced.to_owned()]);
-        }
-        if let Some(categories) = categories_for(layer, &value.content, &value.context) {
-            return Some(categories);
-        }
-    }
-    None
-}
+/// The adapter-level pre-filter (`EXCLUDED_HEADERS`, every `sec-*` name)
+/// keeps framework noise headers out of the surfaces before the engine
+/// sees them. A semantic-only threat carries no category and contributes
+/// nothing here, exactly like the reference's `category == ""` guard.
+fn scan_views(parts: &Parts, body: Option<&Bytes>, layer: &GuardLayer) -> ScanOutcome {
+    let resolved = resolve_exclusions(
+        layer.detection_exclusions(),
+        parts.extensions.get::<RouteDetectionExclusions>(),
+    );
 
-/// One engine call: the flagged view's threat categories, or `None` when the
-/// engine clears the content. Regex threats carry the pattern table's
-/// category; semantic threats carry their attack type.
-fn categories_for(layer: &GuardLayer, content: &str, view: &str) -> Option<Vec<String>> {
-    let verdict = (layer.detect_fn())(content, view, layer.config());
-    if !verdict.is_threat {
-        return None;
+    let path = parts.uri.path();
+    let url_path = if path == "/" { None } else { Some(path) };
+
+    // Query parameter pairs, `parse_qsl`-decoded (the reference reads the
+    // decoded values, so exclusions and detection see what the handler
+    // sees). Per pair, so excluded names are skippable.
+    let query_params: Vec<(String, String)> = parts
+        .uri
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((name, value)) => (decode_query_component(name), decode_query_component(value)),
+            None => (decode_query_component(pair), String::new()),
+        })
+        .collect();
+
+    let headers: Vec<(String, String)> = parts
+        .headers
+        .iter()
+        .filter(|(name, _)| !is_excluded_header(name.as_str()))
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect();
+
+    let content_type = parts
+        .headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let raw_body = body
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_default();
+
+    let surfaces = RequestSurfaces {
+        url_path,
+        query_params: &query_params,
+        headers: &headers,
+        content_type,
+        raw_body: &raw_body,
+    };
+    let verdict = (layer.scan_fn())(&surfaces, &resolved, layer.config());
+    if verdict.is_threat {
+        ScanOutcome::Threat(verdict)
+    } else {
+        ScanOutcome::Clean
     }
-    Some(
-        verdict
-            .threats
-            .iter()
-            .map(|threat| match threat {
-                Threat::Regex(regex) => regex.category.clone(),
-                Threat::Semantic(semantic) => semantic.attack_type.clone(),
-            })
-            .collect(),
-    )
 }
 
 fn is_excluded_header(name: &str) -> bool {
     name.starts_with("sec-") || EXCLUDED_HEADERS.contains(&name)
 }
 
+/// `urllib.parse.unquote_plus` for one query component: `%XX` runs and
+/// `+` (form-encoding's space) decode into the value the reference's
+/// `parse_qsl` hands the engine. Malformed escapes stay literal.
+fn decode_query_component(component: &str) -> String {
+    let plus_decoded = component.replace('+', " ");
+    let bytes = plus_decoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or(""),
+                16,
+            )
+        {
+            out.push(byte);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DetectionExclusionConfig;
     use crate::{
         ACTIVITY_BANNED_MESSAGE, BANNED_MESSAGE, BLOCKED_MESSAGE, FAILURE_MESSAGE,
         FORBIDDEN_MESSAGE, GuardClientIp, IpBanConfig, IpBanManager, IpGateConfig,
         RATE_LIMITED_MESSAGE, RateLimitConfig, RateLimiter, ThreatBanEntry, default_config,
     };
-    use guard_core_engine::detect::{DetectConfig, DetectVerdict};
+    use guard_core_engine::detect::DetectConfig;
     use guard_core_engine::ip_ban::Clock;
     use guard_core_engine::ip_gate::IpGateDecision;
     use http::StatusCode;
@@ -423,10 +442,14 @@ mod tests {
     use std::convert::Infallible;
     use std::net::IpAddr;
     use std::str::FromStr;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use tower::{Layer, ServiceExt};
-    fn panicking_detect(_content: &str, _context: &str, _config: &DetectConfig) -> DetectVerdict {
+    fn panicking_scan(
+        _surfaces: &guard_core_engine::detection_exclusions::RequestSurfaces<'_>,
+        _exclusions: &guard_core_engine::detection_exclusions::ResolvedExclusions,
+        _config: &DetectConfig,
+    ) -> guard_core_engine::detection_exclusions::RequestScanVerdict {
         panic!("engine exploded");
     }
 
@@ -509,7 +532,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_panic_is_recovered_as_a_500() {
-        let layer = GuardLayer::new(default_config()).with_detect_fn(panicking_detect);
+        let layer = GuardLayer::new(default_config()).with_scan_fn(panicking_scan);
         let service = layer.layer(tower::service_fn(
             |request: Request<Full<Bytes>>| async move {
                 Ok::<_, Infallible>(Response::new(request.into_body()))
@@ -535,9 +558,9 @@ mod tests {
             .into_parts()
             .0;
         let outcome = scan_request(&parts, None, &layer);
-        assert_eq!(
-            outcome,
-            ScanOutcome::Threat(vec!["dir_traversal".to_owned()]),
+        assert!(
+            matches!(&outcome, ScanOutcome::Threat(verdict)
+                if verdict.is_threat && verdict.categories == vec!["dir_traversal".to_owned()]),
             "traversal path should be flagged with its category"
         );
     }
@@ -552,7 +575,11 @@ mod tests {
             Some(&Bytes::from_static(b"SELECT * FROM users")),
             &layer,
         );
-        assert_eq!(outcome, ScanOutcome::Threat(vec!["sqli".to_owned()]));
+        assert!(
+            matches!(&outcome, ScanOutcome::Threat(verdict)
+                if verdict.is_threat && verdict.categories == vec!["sqli".to_owned()]),
+            "the body blob should flag sqli once"
+        );
     }
 
     #[tokio::test]
@@ -1018,18 +1045,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exempt_ip_never_counts_detection_violations() {
-        // Checklist: the exempt flag makes violation counting observable -
-        // an exempt attacker can never be auto-banned.
+    async fn exempt_ip_violations_still_count_toward_the_ban() {
+        // Checklist: the exemption skips rate limiting and the ban *check*
+        // skip state never shields counting - the reference's
+        // suspicious-activity stage skips a whitelisted IP only, so an
+        // exempt attacker's detections still feed the auto-ban engine and
+        // a crossed threshold bans on the spot.
         let gate = IpGateConfig::new(NIL, NIL, ["198.51.100.7"]).expect("valid lists");
         let config = IpBanConfig::new(
             true,
-            1,
+            100,
             3600,
             [(
                 "dir_traversal",
                 ThreatBanEntry {
-                    threshold: 1,
+                    threshold: 2,
                     duration: 60,
                 },
             )],
@@ -1045,14 +1075,19 @@ mod tests {
                 .body(Full::new(Bytes::new()))
                 .expect("request")
         };
-        for _ in 0..3 {
-            let (status, body, _) = full_status(&layer, attack()).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(
-                body, BLOCKED_MESSAGE,
-                "exempt violations are not counted, so no ban can fire"
-            );
-        }
+        let (status, body, _) = full_status(&layer, attack()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, BLOCKED_MESSAGE, "violation 1: the plain block shape");
+        let (status, body, _) = full_status(&layer, attack()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body, ACTIVITY_BANNED_MESSAGE,
+            "exempt violations count: the crossed threshold bans"
+        );
+        // From then on the ban stage answers everything.
+        let (status, body, _) = full_status(&layer, benign_request("198.51.100.7")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, BANNED_MESSAGE);
     }
 
     #[tokio::test]
@@ -1250,5 +1285,440 @@ mod tests {
             out.push(u8::try_from(state % 256).expect("value below 256"));
         }
         out
+    }
+    // ---- the wave surfaces, end to end through the public API ----
+
+    /// A static geolocation: every IP maps to `DE`.
+    struct StaticGeo;
+
+    impl guard_core_engine::geo::GeoIpHandler for StaticGeo {
+        fn get_country(&self, _ip: IpAddr) -> Option<String> {
+            Some("DE".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn route_tier_resolver_limits_its_paths_only() {
+        let tiers = Arc::new(|path: &str| {
+            if path.starts_with("/login") {
+                Some(RouteRateLimits::new(Some(1), None, None).expect("valid tiers"))
+            } else {
+                None
+            }
+        });
+        let layer = GuardLayer::new(default_config())
+            .with_rate_limiting(limiter(1000, false))
+            .with_route_tiers(tiers);
+        let (status, _, _) = full_status(&layer, benign_request("192.0.2.71")).await;
+        assert_eq!(status, StatusCode::OK);
+        let request = Request::builder()
+            .uri("/login")
+            .extension(gate_ip("192.0.2.71"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, _, _) = full_status(&layer, request).await;
+        assert_eq!(status, StatusCode::OK);
+        // The route tier is exhausted; the global tier is not.
+        let request = Request::builder()
+            .uri("/login")
+            .extension(gate_ip("192.0.2.71"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, body, retry_after) = full_status(&layer, request).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, RATE_LIMITED_MESSAGE);
+        assert_eq!(retry_after.as_deref(), Some("60"));
+        let (status, _, _) = full_status(&layer, benign_request("192.0.2.71")).await;
+        assert_eq!(status, StatusCode::OK, "other paths keep the global tier");
+    }
+
+    #[tokio::test]
+    async fn route_rate_limits_extension_wins_over_the_resolver() {
+        let tiers = Arc::new(|_path: &str| {
+            Some(RouteRateLimits::new(Some(100), None, None).expect("valid tiers"))
+        });
+        let layer = GuardLayer::new(default_config())
+            .with_rate_limiting(limiter(1000, false))
+            .with_route_tiers(tiers);
+        // The extension configures a stricter tier than the resolver's
+        // for the request: the first passes, the second crosses it.
+        let request = Request::builder()
+            .uri("/tight")
+            .extension(gate_ip("192.0.2.72"))
+            .extension(RouteRateLimits::new(Some(1), None, None).expect("valid tiers"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, _, _) = full_status(&layer, request).await;
+        assert_eq!(status, StatusCode::OK, "the extension tier allows one");
+        let request = Request::builder()
+            .uri("/tight")
+            .extension(gate_ip("192.0.2.72"))
+            .extension(RouteRateLimits::new(Some(1), None, None).expect("valid tiers"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, _, _) = full_status(&layer, request).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the extension tier wins over the resolver"
+        );
+    }
+
+    #[tokio::test]
+    async fn geo_tier_limits_the_resolved_country() {
+        let mut geo = std::collections::HashMap::new();
+        geo.insert(
+            "DE".to_owned(),
+            guard_core_rs::tower::RateLimitEntry::new(1, 60).expect("valid entry"),
+        );
+        let tiers = Arc::new(move |_path: &str| {
+            Some(RouteRateLimits::new(None, None, Some(geo.clone())).expect("valid tiers"))
+        });
+        let layer = GuardLayer::new(default_config())
+            .with_rate_limiting(limiter(1000, false))
+            .with_route_tiers(tiers)
+            .with_geo_handler(Arc::new(StaticGeo));
+        let (status, _, _) = full_status(&layer, benign_request("192.0.2.73")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) = full_status(&layer, benign_request("192.0.2.73")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "the DE tier crossed");
+    }
+
+    #[tokio::test]
+    async fn geo_tier_never_applies_without_a_handler() {
+        let mut geo = std::collections::HashMap::new();
+        geo.insert(
+            "DE".to_owned(),
+            guard_core_rs::tower::RateLimitEntry::new(1, 60).expect("valid entry"),
+        );
+        let tiers = Arc::new(move |_path: &str| {
+            Some(RouteRateLimits::new(None, None, Some(geo.clone())).expect("valid tiers"))
+        });
+        let layer = GuardLayer::new(default_config()).with_route_tiers(tiers);
+        for _ in 0..5 {
+            let (status, _, _) = full_status(&layer, benign_request("192.0.2.74")).await;
+            assert_eq!(status, StatusCode::OK, "no handler: the geo tier is inert");
+        }
+    }
+
+    #[tokio::test]
+    async fn excluded_detection_params_pass_and_other_params_scan() {
+        let exclusions = DetectionExclusionConfig {
+            excluded_detection_params: vec!["q".to_owned()],
+            ..DetectionExclusionConfig::default()
+        };
+        let layer = GuardLayer::new(default_config()).with_detection_exclusions(exclusions);
+        let attack = |uri: &'static str| {
+            Request::builder()
+                .uri(uri)
+                .body(Full::new(Bytes::new()))
+                .expect("request")
+        };
+        let response = guarded(&layer)
+            .oneshot(attack("/search?q=1+OR+1%3D1"))
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the excluded param is not scanned"
+        );
+        let response = guarded(&layer)
+            .oneshot(attack("/search?page=2&q=1+OR+1%3D1"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = guarded(&layer)
+            .oneshot(attack("/search?page=1+OR+1%3D1"))
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a non-excluded param still scans"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_detection_exclusions_override_the_global_config_per_request() {
+        // Global: the `q` param is excluded. Route extension (per request):
+        // an empty set re-enables the param surface - the route replaces
+        // the global set.
+        let exclusions = DetectionExclusionConfig {
+            excluded_detection_params: vec!["q".to_owned()],
+            ..DetectionExclusionConfig::default()
+        };
+        let layer = GuardLayer::new(default_config()).with_detection_exclusions(exclusions);
+        let route = RouteDetectionExclusions {
+            excluded_detection_params: Some(vec![]),
+            ..RouteDetectionExclusions::default()
+        };
+        let request = Request::builder()
+            .uri("/search?q=1+OR+1%3D1")
+            .extension(route)
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = guarded(&layer).oneshot(request).await.expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "the route re-enables the param surface"
+        );
+    }
+
+    #[tokio::test]
+    async fn detection_scan_body_false_skips_the_body_surface() {
+        let exclusions = DetectionExclusionConfig {
+            detection_scan_body: Some(false),
+            ..DetectionExclusionConfig::default()
+        };
+        let layer = GuardLayer::new(default_config()).with_detection_exclusions(exclusions);
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .uri("/submit")
+            .body(body_bytes(b"SELECT * FROM users"))
+            .expect("request");
+        let response = guarded(&layer).oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK, "the body does not scan");
+        // The path surface still scans.
+        let request = Request::builder()
+            .uri("/files/../../etc/passwd")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = guarded(&layer).oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn route_scan_body_true_reenables_the_body() {
+        let exclusions = DetectionExclusionConfig {
+            detection_scan_body: Some(false),
+            ..DetectionExclusionConfig::default()
+        };
+        let layer = GuardLayer::new(default_config()).with_detection_exclusions(exclusions);
+        let route = RouteDetectionExclusions {
+            detection_scan_body: Some(true),
+            ..RouteDetectionExclusions::default()
+        };
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .uri("/submit")
+            .extension(route)
+            .body(body_bytes(b"SELECT * FROM users"))
+            .expect("request");
+        let response = guarded(&layer).oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn excluded_body_fields_resolve_through_the_engine() {
+        let exclusions = DetectionExclusionConfig {
+            excluded_detection_body_fields: vec!["note".to_owned()],
+            ..DetectionExclusionConfig::default()
+        };
+        let layer = GuardLayer::new(default_config()).with_detection_exclusions(exclusions);
+        let attack = |body: &'static [u8]| {
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/submit")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(body_bytes(body))
+                .expect("request")
+        };
+        let response = guarded(&layer)
+            .oneshot(attack(b"note=1+OR+1%3D1"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK, "excluded field skips");
+        let response = guarded(&layer)
+            .oneshot(attack(b"other=1+OR+1%3D1"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The `on_block` collector: the payloads the guard fired.
+    fn block_collector() -> (
+        Arc<Mutex<Vec<guard_core_rs::responses::BlockPayload>>>,
+        guard_core_rs::responses::OnBlockHook,
+    ) {
+        let payloads: Arc<Mutex<Vec<guard_core_rs::responses::BlockPayload>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&payloads);
+        let hook: guard_core_rs::responses::OnBlockHook =
+            Arc::new(move |payload| sink.lock().expect("payloads").push(payload.clone()));
+        (payloads, hook)
+    }
+
+    #[tokio::test]
+    async fn on_block_fires_for_the_detection_block_and_custom_body_overrides_it() {
+        let (payloads, hook) = block_collector();
+        let layer = GuardLayer::new(default_config())
+            .with_observability(guard_core_rs::tower::ObservabilityConfig::default())
+            .with_on_block(hook)
+            .with_custom_error_responses(
+                [(400u16, "blocked:custom".to_owned())]
+                    .into_iter()
+                    .collect(),
+            );
+        let request = Request::builder()
+            .uri("/files/../../etc/passwd")
+            .extension(gate_ip("192.0.2.75"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, body) = status_and_body(&layer, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body, "blocked:custom",
+            "the custom body overrides the default"
+        );
+        let payloads = payloads.lock().expect("payloads");
+        assert_eq!(payloads.len(), 1, "exactly one payload for the block");
+        let payload = &payloads[0];
+        assert_eq!(payload.check_name, "suspicious_activity");
+        assert_eq!(payload.status_code, Some(400));
+        assert_eq!(payload.client_ip, "192.0.2.75");
+        assert!(!payload.passive_mode);
+    }
+
+    #[tokio::test]
+    async fn custom_error_responses_override_the_throttled_body() {
+        let layer = GuardLayer::new(default_config())
+            .with_rate_limiting(limiter(1, false))
+            .with_custom_error_responses(
+                [(429u16, "slow down:custom".to_owned())]
+                    .into_iter()
+                    .collect(),
+            );
+        let (status, _, _) = full_status(&layer, benign_request("192.0.2.76")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body, retry_after) = full_status(&layer, benign_request("192.0.2.76")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, "slow down:custom");
+        assert_eq!(retry_after.as_deref(), Some("60"), "Retry-After survives");
+    }
+
+    #[tokio::test]
+    async fn passive_mode_records_but_never_blocks() {
+        let layer = GuardLayer::new(default_config())
+            .with_rate_limiting(limiter(1, false))
+            .with_passive_mode(true);
+        // A detection attack forwards (200) instead of the 400 block.
+        let attack = Request::builder()
+            .uri("/files/../../etc/passwd")
+            .extension(gate_ip("192.0.2.77"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, _, _) = full_status(&layer, attack).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "passive: the detection block is log-only"
+        );
+        // A rate-limit crossing forwards too.
+        let (status, _, _) = full_status(&layer, benign_request("192.0.2.78")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) = full_status(&layer, benign_request("192.0.2.78")).await;
+        assert_eq!(status, StatusCode::OK, "passive: no 429 is rendered");
+    }
+
+    #[tokio::test]
+    async fn event_bus_receives_the_rate_limited_event() {
+        let events: Arc<Mutex<Vec<guard_core_rs::events::SecurityEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let bus = Arc::new(
+            guard_core_rs::events::SecurityEventBus::new(true).on_event(Arc::new(move |event| {
+                sink.lock().expect("events").push(event.clone());
+            })),
+        );
+        let layer = GuardLayer::new(default_config())
+            .with_rate_limiting(limiter(1, false))
+            .with_event_bus(bus);
+        let (status, _, _) = full_status(&layer, benign_request("192.0.2.79")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) = full_status(&layer, benign_request("192.0.2.79")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let events = events.lock().expect("events");
+        assert!(
+            events.iter().any(|event| event.event_type == "rate_limited"
+                && event.ip_address == "192.0.2.79"
+                && event.action_taken == "request_blocked"
+                && event.handler_name.as_deref() == Some("rate_limit")),
+            "the rate_limited event fired: {events:?}"
+        );
+    }
+
+    /// A distributed store that always fails (the backend is down).
+    struct DownStore;
+
+    impl guard_core_rs::tower::SlidingWindowStore for DownStore {
+        fn record_hit(
+            &self,
+            _key: &str,
+            _now: f64,
+            _window: u64,
+        ) -> Result<u64, guard_core_engine::distributed::StoreError> {
+            Err(guard_core_engine::distributed::StoreError(String::new()))
+        }
+    }
+
+    #[tokio::test]
+    async fn distributed_store_fail_closed_answers_the_503_shape() {
+        let layer = GuardLayer::new(default_config())
+            .with_rate_limiting(limiter(10, false))
+            .with_distributed_store(
+                Arc::new(DownStore) as Arc<dyn guard_core_rs::tower::SlidingWindowStore>,
+                "guard_core:",
+                false,
+            );
+        let (status, body, retry_after) = full_status(&layer, benign_request("192.0.2.80")).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "fail-closed backend error"
+        );
+        assert_eq!(body, "Redis rate limiting unavailable");
+        assert_eq!(retry_after, None);
+    }
+
+    #[tokio::test]
+    async fn distributed_store_fail_open_degrades_to_memory() {
+        let layer = GuardLayer::new(default_config())
+            .with_rate_limiting(limiter(1, false))
+            .with_distributed_store(
+                Arc::new(DownStore) as Arc<dyn guard_core_rs::tower::SlidingWindowStore>,
+                "guard_core:",
+                true,
+            );
+        let (status, _, _) = full_status(&layer, benign_request("192.0.2.81")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body, _) = full_status(&layer, benign_request("192.0.2.81")).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "memory window decided"
+        );
+        assert_eq!(body, RATE_LIMITED_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn custom_error_responses_reach_the_banned_shapes() {
+        let manager = IpBanManager::new();
+        let config = IpBanConfig::new(true, 10, 3600, no_entries()).expect("valid config");
+        let layer = GuardLayer::new(default_config())
+            .with_ip_banning(manager.clone(), config)
+            .with_custom_error_responses(
+                [(403u16, "denied:custom".to_owned())].into_iter().collect(),
+            );
+        manager
+            .ban_ip(IpAddr::from_str("192.0.2.82").expect("ip"), 60, "operator")
+            .expect("ban");
+        let (status, body, _) = full_status(&layer, benign_request("192.0.2.82")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body, "denied:custom",
+            "the live-ban shape takes the override"
+        );
     }
 }

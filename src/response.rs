@@ -27,33 +27,8 @@ pub const OVERSIZE_MESSAGE: &str = "Payload too large";
 /// Detail message carried by the fail-secure `500` response.
 pub const FAILURE_MESSAGE: &str = "Security check failed";
 
-pub(crate) fn blocked() -> Response<Full<Bytes>> {
-    plain_text(StatusCode::BAD_REQUEST, BLOCKED_MESSAGE)
-}
-
 pub(crate) fn forbidden() -> Response<Full<Bytes>> {
     plain_text(StatusCode::FORBIDDEN, FORBIDDEN_MESSAGE)
-}
-
-/// The ban stage's denial: a live ban on the client IP.
-pub(crate) fn banned_ip() -> Response<Full<Bytes>> {
-    plain_text(StatusCode::FORBIDDEN, BANNED_MESSAGE)
-}
-
-/// The auto-ban engine's denial: the detected threat crossed a threshold and
-/// the ban fired on this very request.
-pub(crate) fn activity_banned() -> Response<Full<Bytes>> {
-    plain_text(StatusCode::FORBIDDEN, ACTIVITY_BANNED_MESSAGE)
-}
-
-/// The rate limiter's denial, carrying `Retry-After: <window seconds>` the
-/// way the references do.
-pub(crate) fn rate_limited(retry_after: u64) -> Response<Full<Bytes>> {
-    let mut response = plain_text(StatusCode::TOO_MANY_REQUESTS, RATE_LIMITED_MESSAGE);
-    if let Ok(value) = retry_after.to_string().parse() {
-        response.headers_mut().insert(RETRY_AFTER, value);
-    }
-    response
 }
 
 pub(crate) fn oversize() -> Response<Full<Bytes>> {
@@ -62,6 +37,37 @@ pub(crate) fn oversize() -> Response<Full<Bytes>> {
 
 pub(crate) fn failure() -> Response<Full<Bytes>> {
     plain_text(StatusCode::INTERNAL_SERVER_ERROR, FAILURE_MESSAGE)
+}
+
+/// The engine stage's block answer rendered in the family shape: the
+/// custom-error body override wins over the reference default message, and
+/// the throttled shape carries `Retry-After: <window seconds>`.
+pub(crate) fn stage(stage: &guard_core_rs::tower::StageResponse) -> Response<Full<Bytes>> {
+    let mut response = match &stage.custom_body {
+        Some(body) => plain_text_owned(stage.status, body.clone()),
+        None => plain_text(stage.status, stage.body),
+    };
+    if let Some(retry_after) = stage.retry_after
+        && let Ok(value) = retry_after.to_string().parse()
+    {
+        response.headers_mut().insert(RETRY_AFTER, value);
+    }
+    response
+}
+
+/// The plain-text shape for a composed (non-`static`) body.
+fn plain_text_owned(status: StatusCode, message: String) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::from(message)))
+        .expect("static status and header values are always valid")
+}
+
+/// The family block shape with a composed body override.
+pub(crate) fn blocked_with_body(status: u16, message: &str) -> Response<Full<Bytes>> {
+    let status = StatusCode::from_u16(status).expect("a valid block status");
+    plain_text_owned(status, message.to_owned())
 }
 
 /// The ecosystem's error shape: the bare message as the body,
@@ -88,17 +94,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocked_response_shape() {
-        let response = blocked();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            response.headers().get(CONTENT_TYPE).expect("content type"),
-            "text/plain; charset=utf-8"
-        );
-        assert_eq!(body_bytes(response.into_body()).await, BLOCKED_MESSAGE);
-    }
-
-    #[tokio::test]
     async fn forbidden_response_shape() {
         let response = forbidden();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -107,34 +102,6 @@ mod tests {
             "text/plain; charset=utf-8"
         );
         assert_eq!(body_bytes(response.into_body()).await, FORBIDDEN_MESSAGE);
-    }
-
-    #[tokio::test]
-    async fn banned_response_shape() {
-        let response = banned_ip();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(body_bytes(response.into_body()).await, BANNED_MESSAGE);
-    }
-
-    #[tokio::test]
-    async fn activity_banned_response_shape() {
-        let response = activity_banned();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(
-            body_bytes(response.into_body()).await,
-            ACTIVITY_BANNED_MESSAGE
-        );
-    }
-
-    #[tokio::test]
-    async fn rate_limited_response_shape_carries_retry_after() {
-        let response = rate_limited(90);
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            response.headers().get(RETRY_AFTER).expect("retry after"),
-            "90"
-        );
-        assert_eq!(body_bytes(response.into_body()).await, RATE_LIMITED_MESSAGE);
     }
 
     #[tokio::test]
