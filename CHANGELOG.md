@@ -4,6 +4,24 @@ All notable changes to this project.
 
 ## [Unreleased]
 
+### Added
+
+- The wave surfaces are publicly configurable on `GuardLayer`, each wired to the engine facade's rate-limit stage (`guard_core_rs::tower::RateLimitStage`, which the layer now builds and delegates every stateful decision and emission to):
+  - `with_route_tiers(resolver)` (`path -> Option<RouteRateLimits>`, the tower counterpart of `request.state.route_config`; a `RouteRateLimits` request extension wins over the resolver) and `with_geo_handler(Arc<dyn GeoIpHandler>)`: the reference's endpoint/route/geo rate-limit tiers; the first tier that crosses answers the same `429 + Retry-After` shape and feeds the auto-ban engine
+  - `with_detection_exclusions(DetectionExclusionConfig)` plus the `RouteDetectionExclusions` request extension: the reference per-route detection-exclusion surface (`excluded_detection_headers/params/body_fields`, `enabled_detection_categories`, `detection_scan_body`), resolved per request through the engine's `detection_exclusions::resolve` + `scan_request` (excluded params and body fields skip, excluded headers scan with their false-positive categories suppressed, an all-filtered threat ends the scan clean)
+  - `with_event_bus(Arc<SecurityEventBus>)`: the `penetration_attempt`/`rate_limited`/`ip_banned` events with the reference fields, metadata, and redaction
+  - `with_observability(ObservabilityConfig)`: `log_suspicious_level`, `muted_check_logs`, and the `log_sensitive_headers/params/body_fields` redaction sets for the suspicious log lines, event fields, and `on_block` payloads
+  - `with_on_block(OnBlockHook)` and `with_custom_error_responses(CustomErrorResponses)`: the hook fires exactly once per blocked request (and per passive-flagged detection with no status); the status-to-body map overrides every block body, the `400` detection block included
+  - `with_distributed_store(window_store, redis_prefix, redis_fail_open)` + `with_distributed_ban_store(store)`: the reference distributed mode (fail-closed backend errors answer `503 "Redis rate limiting unavailable"`, `fail_open = true` degrades to the in-memory window)
+  - `with_passive_mode(bool)`: the reference passive mode - windows and counters record, log lines and events fire, no block ever renders
+- New re-exports: `DetectionExclusionConfig`, `RouteDetectionExclusions`, `GeoIpHandler`, `BanStore`, `SlidingWindowStore`, `ViolationCounters`, `RouteRateLimits`, `RateLimitEntry`, `RateLimitTier`, `TierDecision`, `SecurityEventBus`, `ObservabilityConfig`, `RequestObservation`, `StageResponse`, `BlockPayload`, `OnBlockHook`, `CustomErrorResponses`
+
+### Changed
+
+- `guard-core-rs` (the engine facade) joins `guard-core-engine` as a pinned 4.1.0 dependency with the sibling-checkout path fallback; the stage delegation is an implementation detail behind the existing `with_rate_limiting`/`with_ip_banning` signatures, which keep their shared-handle semantics (out-of-band bans and custom clocks honored) through the stage builder's `limiter`/`ban_manager` injection seams
+- Scan semantics move onto the engine's reference surface: the query string is scanned as `parse_qsl`-decoded per-parameter pairs (previously one raw encoded blob), and the headers the exclusion resolution marks are scanned with their known false-positive categories suppressed (`ssrf` for address-chain values) instead of an adapter-level blanket skip. Exempt IPs now feed the violation counters (the reference suspicious-activity stage skips a whitelisted IP only; detection still scans and blocks them), so a crossed threshold bans even an exempt attacker
+
+
 ## [1.1.0] - 2026-09-26
 
 ### Added

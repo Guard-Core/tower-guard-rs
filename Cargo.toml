@@ -23,6 +23,12 @@ bytes = "1.10"
 # (see .github/workflows/ci.yml) exercise the engine from source. The version
 # pin stays in lockstep with the published engine release.
 guard-core-engine = { path = "../guard-core-rs/crates/guard-core-engine", version = "4.1.0" }
+# The engine facade (the event bus, observability knobs, the on_block hook,
+# custom error responses, and the rate-limit stage the layer delegates to).
+# Path points at the sibling guard-core-rs checkout so local builds and CI
+# exercise it from source; the version pin stays in lockstep with the
+# published facade release.
+guard-core-rs = { path = "../guard-core-rs/crates/guard-core-rs", version = "4.1.0" }
 http = "1.3"
 http-body = "1.0"
 http-body-util = "0.1"
