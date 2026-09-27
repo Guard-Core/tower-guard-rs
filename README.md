@@ -6,7 +6,7 @@ Docs: <https://rennf93.github.io/tower-guard-rs/>
 
 Works with any framework built on `tower::Service`, including [axum](https://github.com/tokio-rs/axum) (see [axum-guard-rs](https://github.com/rennf93/axum-guard-rs)), [hyper](https://github.com/hyperium/hyper), and [warp](https://github.com/seanmonstar/warp).
 
-**Status:** Released. Version 1.0.0, published to crates.io. `GuardLayer` and `GuardService` are working `tower` middleware over `http::Request<B>`, screened by the engine.
+**Status:** Released. Version 1.1.0, published to crates.io. `GuardLayer` and `GuardService` are working `tower` middleware over `http::Request<B>`, screened by the engine.
 
 ## About
 
@@ -89,7 +89,7 @@ A body larger than the cap is rejected with `413` rather than forwarded unscanne
 
 ## Engine dependency
 
-The Cargo.toml pins `guard-core-engine` 4.0.4, published to crates.io, and also carries a path pointing at the engine crate inside a sibling `guard-core-rs` checkout (`../guard-core-rs/crates/guard-core-engine`) so local builds and CI compile the engine from source; consumers installing the crate from the registry resolve the engine normally. CI checks out `rennf93/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `laravel-guard`/`symfony-guard`.
+The Cargo.toml pins `guard-core-engine` and `guard-core-rs` at 4.1.0 and carries paths pointing at the sibling `guard-core-rs` checkout (`../guard-core-rs/crates/guard-core-engine`, `../guard-core-rs/crates/guard-core-rs`) so local builds and CI compile the engine from source. Registry note, stated plainly: the 4.1.0 dists of `guard-core-engine` and `guard-core-rs` are currently yanked on crates.io, so the published 1.1.0 of this crate cannot resolve its engine from the registry alone (a fresh `cargo add tower-guard-rs` falls back to 1.0.0 with engine 4.0.4). Resolution is restored at the synchronized 4.2.0 train; until then the sibling path dependencies are the working route. CI checks out `rennf93/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `laravel-guard`/`symfony-guard`.
 
 The adapter now depends on both halves of the sibling checkout: the `guard-core-engine` crate (detection, rate limiting, bans, exclusions, geo, distributed traits) and the `guard-core-rs` facade (the event bus, the log/redaction port, the `on_block`/custom-error contract, and the rate-limit stage the layer delegates to), both pinned at 4.1.0 with path fallbacks into `../guard-core-rs`.
 
