@@ -533,17 +533,12 @@ mod tests {
     #[tokio::test]
     async fn engine_panic_is_recovered_as_a_500() {
         let layer = GuardLayer::new(default_config()).with_scan_fn(panicking_scan);
-        let service = layer.layer(tower::service_fn(
-            |request: Request<Full<Bytes>>| async move {
-                Ok::<_, Infallible>(Response::new(request.into_body()))
-            },
-        ));
         let request = Request::builder()
             .uri("/hello")
             .body(Full::new(Bytes::from_static(b"ping")))
             .expect("request");
 
-        let response = service.oneshot(request).await.expect("response");
+        let response = guarded(&layer).oneshot(request).await.expect("response");
         assert_eq!(response.status(), 500);
         assert_eq!(body_text(response).await, FAILURE_MESSAGE);
     }
@@ -599,14 +594,11 @@ mod tests {
     #[tokio::test]
     async fn blocked_response_body_reports_the_documented_message() {
         let layer = GuardLayer::new(default_config());
-        let service = layer.layer(tower::service_fn(|_request: Request<Full<Bytes>>| async {
-            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
-        }));
         let request = Request::builder()
             .uri("/files/../../etc/passwd")
             .body(Full::new(Bytes::new()))
             .expect("request");
-        let response = service.oneshot(request).await.expect("response");
+        let response = guarded(&layer).oneshot(request).await.expect("response");
         assert_eq!(response.status(), 400);
         assert_eq!(body_text(response).await, BLOCKED_MESSAGE);
     }
@@ -1362,6 +1354,18 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "the extension tier wins over the resolver"
         );
+        // Without the extension the resolver's looser tier decides.
+        let request = Request::builder()
+            .uri("/tight")
+            .extension(gate_ip("192.0.2.72"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, _, _) = full_status(&layer, request).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the resolver's tier still serves extension-less requests"
+        );
     }
 
     #[tokio::test]
@@ -1720,5 +1724,162 @@ mod tests {
             body, "denied:custom",
             "the live-ban shape takes the override"
         );
+    }
+
+    #[tokio::test]
+    async fn service_debug_renders_the_inner_and_layer() {
+        let layer = GuardLayer::new(default_config());
+        let service = layer.layer(tower::service_fn(
+            |_request: Request<Full<Bytes>>| async move {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+            },
+        ));
+        let rendered = format!("{service:?}");
+        assert!(rendered.starts_with("GuardService"), "{rendered}");
+        // The wrapped service still serves: a benign request passes.
+        let request = Request::builder()
+            .uri("/hello")
+            .extension(gate_ip("192.0.2.85"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn whitelisted_ip_still_gets_the_detection_block_and_payload() {
+        // A whitelisted IP skips the stateful stages, so the stage answers
+        // nothing and the adapter renders the detection block itself,
+        // firing the reference hook payload with the resolved identity.
+        let (payloads, hook) = block_collector();
+        let gate = IpGateConfig::new(["192.0.2.83"], NIL, NIL).expect("valid lists");
+        let layer = GuardLayer::new(default_config())
+            .with_ip_gate(gate)
+            .with_observability(guard_core_rs::tower::ObservabilityConfig::default())
+            .with_on_block(hook);
+        let request = Request::builder()
+            .uri("/files/../../etc/passwd")
+            .extension(gate_ip("192.0.2.83"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, body) = status_and_body(&layer, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "detection never skips");
+        assert_eq!(body, BLOCKED_MESSAGE);
+        let payloads = payloads.lock().expect("payloads");
+        assert_eq!(payloads.len(), 1, "exactly one payload for the block");
+        assert_eq!(payloads[0].check_name, "suspicious_activity");
+        assert_eq!(payloads[0].client_ip, "192.0.2.83");
+        assert_eq!(payloads[0].status_code, Some(400));
+        assert!(!payloads[0].passive_mode);
+    }
+
+    #[tokio::test]
+    async fn valueless_query_parameter_is_benign() {
+        // A query pair without `=` (`?flag`) is a name with an empty value;
+        // it must decode and scan like any other pair, not fall over.
+        let layer = GuardLayer::new(default_config());
+        let request = Request::builder()
+            .uri("/api/items?flag")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, _) = status_and_body(&layer, request).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A body that yields its data frame and then a trailers frame: the
+    /// buffered scan must skip non-data frames instead of failing.
+    #[derive(Debug)]
+    struct TraileredBody {
+        inner: Full<Bytes>,
+        trailers_sent: bool,
+    }
+
+    impl TraileredBody {
+        fn new(bytes: &'static [u8]) -> Self {
+            Self {
+                inner: Full::new(Bytes::from_static(bytes)),
+                trailers_sent: false,
+            }
+        }
+    }
+
+    impl Body for TraileredBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            if !self.inner.is_end_stream() {
+                return Pin::new(&mut self.inner).poll_frame(cx);
+            }
+            if self.trailers_sent {
+                return Poll::Ready(None);
+            }
+            self.trailers_sent = true;
+            Poll::Ready(Some(Ok(http_body::Frame::trailers(http::HeaderMap::new()))))
+        }
+
+        fn is_end_stream(&self) -> bool {
+            false
+        }
+    }
+
+    /// The forwarded rebuild carries only the buffered bytes: the trailers
+    /// were consumed by the buffering scan.
+    impl From<Bytes> for TraileredBody {
+        fn from(bytes: Bytes) -> Self {
+            Self {
+                inner: Full::new(bytes),
+                trailers_sent: true,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn trailers_frames_are_ignored_by_the_buffering_scan() {
+        let layer = GuardLayer::new(default_config());
+        let service = layer.layer(tower::service_fn(
+            |_request: Request<TraileredBody>| async move {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+            },
+        ));
+        let body = TraileredBody::new(b"hello");
+        assert!(!body.is_end_stream(), "data and trailers remain");
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .uri("/submit")
+            .body(body)
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "benign data, benign trailers"
+        );
+    }
+
+    #[tokio::test]
+    async fn distributed_ban_store_wires_into_the_stage() {
+        // The engine's `MemoryStore` speaks both halves of the distributed
+        // seam; installing it as the ban store too must rate limit through
+        // the shared backend.
+        let store = Arc::new(guard_core_engine::distributed::MemoryStore::default());
+        let layer = GuardLayer::new(default_config())
+            .with_rate_limiting(limiter(2, false))
+            .with_distributed_store(
+                Arc::clone(&store) as Arc<dyn guard_core_rs::tower::SlidingWindowStore>,
+                "guard_core:",
+                true,
+            )
+            .with_distributed_ban_store(store as Arc<dyn guard_core_engine::distributed::BanStore>);
+        for _ in 0..2 {
+            let (status, _, _) = full_status(&layer, benign_request("192.0.2.84")).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (status, body, _) = full_status(&layer, benign_request("192.0.2.84")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, RATE_LIMITED_MESSAGE);
     }
 }

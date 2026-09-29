@@ -800,4 +800,29 @@ mod tests {
         let layer = layer.with_body_cap(1024);
         assert_eq!(layer.body_cap(), 1024);
     }
+
+    #[test]
+    fn with_defaults_uses_the_corpus_config() {
+        let layer = GuardLayer::with_defaults();
+        assert_eq!(layer.body_cap(), 262_144);
+    }
+
+    #[test]
+    fn ban_state_debug_renders_the_manager_and_config() {
+        let entries: Vec<(String, ThreatBanEntry)> = Vec::new();
+        let state = BanState {
+            manager: IpBanManager::new(),
+            counters: ViolationCounters::new(),
+            config: IpBanConfig::new(true, 10, 3600, entries).expect("valid config"),
+        };
+        let rendered = format!("{state:?}");
+        assert!(rendered.starts_with("BanState"), "{rendered}");
+    }
+
+    #[test]
+    fn layer_debug_renders_the_configuration_shape() {
+        let rendered = format!("{:?}", GuardLayer::new(default_config()));
+        assert!(rendered.starts_with("GuardLayer"), "{rendered}");
+        assert!(rendered.contains("body_cap: 262144"), "{rendered}");
+    }
 }

@@ -92,6 +92,22 @@ mod tests {
         }
     }
 
+    /// A body that never yields a frame (the transport stalls).
+    #[derive(Debug)]
+    struct PendingBody;
+
+    impl Body for PendingBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+    }
+
     fn poll_once<B>(body: &mut B) -> Option<Result<Frame<Bytes>, BoxError>>
     where
         B: Body<Data = Bytes, Error: Into<BoxError>> + Unpin,
@@ -109,6 +125,31 @@ mod tests {
         let mut body = GuardBody::Passthrough(CopyBody(Full::new(Bytes::from_static(b"ok"))));
         let frame = poll_once(&mut body).expect("frame").expect("data");
         assert_eq!(frame.into_data().expect("data"), &b"ok"[..]);
+    }
+
+    #[test]
+    fn passthrough_delegates_the_body_metadata() {
+        let body = GuardBody::Passthrough(CopyBody(Full::new(Bytes::from_static(b"ok"))));
+        assert!(!body.is_end_stream(), "bytes remain");
+        let hint = body.size_hint();
+        assert_eq!(hint.exact(), Some(2));
+    }
+
+    #[test]
+    fn generated_reports_its_exact_size() {
+        let mut body: GuardBody<Full<Bytes>> =
+            GuardBody::Generated(Full::new(Bytes::from_static(b"blocked")));
+        assert_eq!(body.size_hint().exact(), Some(7));
+        let frame = poll_once(&mut body).expect("frame").expect("data");
+        assert_eq!(frame.into_data().expect("data"), &b"blocked"[..]);
+        assert!(body.is_end_stream(), "the frame was consumed");
+    }
+
+    #[test]
+    #[should_panic(expected = "expected a ready frame")]
+    fn poll_once_panics_when_the_body_pends() {
+        let mut body = GuardBody::Passthrough(PendingBody);
+        let _ = poll_once(&mut body);
     }
 
     #[test]
