@@ -826,3 +826,39 @@ mod tests {
         assert!(rendered.contains("body_cap: 262144"), "{rendered}");
     }
 }
+
+#[cfg(test)]
+mod layer_gap_twins {
+    use super::*;
+    use bytes::Bytes;
+    use http::Request;
+    use http::StatusCode;
+    use http_body_util::Full;
+    use std::convert::Infallible;
+
+    #[tokio::test]
+    async fn layer_builds_the_stage_lazily_on_first_wrap() {
+        // layer() on a fresh GuardLayer takes the `stage.is_none()` arm:
+        // the stage is built once and cached into the wrapped service.
+        let layer = GuardLayer::new(default_config());
+        let mut service = Layer::layer(
+            &layer,
+            tower::service_fn(|_request: Request<Full<Bytes>>| async {
+                Ok::<_, Infallible>(
+                    http::Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from_static(b"ok")))
+                        .expect("static response"),
+                )
+            }),
+        );
+        let request = Request::builder()
+            .uri("/hello")
+            .body(Full::new(Bytes::from_static(b"ping")))
+            .expect("request");
+        let response = tower::Service::call(&mut service, request)
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}

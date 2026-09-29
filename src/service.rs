@@ -438,7 +438,7 @@ mod tests {
     use guard_core_engine::ip_ban::Clock;
     use guard_core_engine::ip_gate::IpGateDecision;
     use http::StatusCode;
-    use http_body_util::Full;
+    use http_body_util::{BodyExt, Full};
     use std::convert::Infallible;
     use std::net::IpAddr;
     use std::str::FromStr;
@@ -528,6 +528,82 @@ mod tests {
             .expect("body")
             .to_bytes();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// A body whose single frame is an error: drives the Read arm of the
+    /// buffering loop at the unit level (twin of the integration
+    /// `body_read_error` test, so this binary's copy executes it too).
+    struct ExplodingBody;
+
+    impl From<Bytes> for ExplodingBody {
+        fn from(_: Bytes) -> Self {
+            Self
+        }
+    }
+
+    impl http_body::Body for ExplodingBody {
+        type Data = Bytes;
+        type Error = String;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(Some(Err("body exploded".to_owned())))
+        }
+    }
+
+    #[tokio::test]
+    async fn oversize_body_takes_the_too_large_buffer_arm() {
+        let layer = GuardLayer::new(default_config()).with_body_cap(4);
+        let request = Request::builder()
+            .uri("/hello")
+            .body(Full::new(Bytes::from_static(b"0123456789")))
+            .expect("request");
+        let response = guarded(&layer).oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn failing_body_fails_secure_with_the_500_shape() {
+        use tower::ServiceExt;
+
+        let layer = GuardLayer::new(default_config());
+        let svc = layer.layer(tower::service_fn(
+            |_request: Request<ExplodingBody>| async move {
+                Ok::<_, Infallible>(
+                    http::Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from_static(b"unreachable")))
+                        .expect("static response"),
+                )
+            },
+        ));
+        let request = Request::builder()
+            .uri("/hello")
+            .body(ExplodingBody)
+            .expect("request");
+        let response = svc.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert_eq!(&bytes, FAILURE_MESSAGE.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn benign_body_with_user_agent_is_buffered_and_forwarded() {
+        let layer = GuardLayer::new(default_config());
+        let request = Request::builder()
+            .uri("/hello")
+            .header("user-agent", "gap-twin/1.0")
+            .body(Full::new(Bytes::from_static(b"benign body")))
+            .expect("request");
+        let response = guarded(&layer).oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
