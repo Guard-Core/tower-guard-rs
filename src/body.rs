@@ -160,4 +160,61 @@ mod tests {
         assert_eq!(frame.into_data().expect("data"), &b"blocked"[..]);
         assert!(body.is_end_stream());
     }
+
+    #[test]
+    fn passthrough_of_a_full_body_delegates_the_metadata() {
+        // The passthrough arms of the metadata delegates, exercised on the
+        // plain `Full` body the middleware forwards most often.
+        let body = GuardBody::Passthrough(Full::new(Bytes::from_static(b"ok")));
+        assert!(!body.is_end_stream(), "bytes remain");
+        assert_eq!(body.size_hint().exact(), Some(2));
+    }
+
+    /// A body that delivers exactly one frame and then stalls: the transport
+    /// handed over a chunk but never completes.
+    #[derive(Debug)]
+    struct FrameThenPending {
+        first: Full<Bytes>,
+        delivered: bool,
+    }
+
+    impl Body for FrameThenPending {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if self.delivered {
+                return Poll::Pending;
+            }
+            self.delivered = true;
+            Pin::new(&mut self.first).poll_frame(cx)
+        }
+    }
+
+    fn frame_then_pending() -> GuardBody<FrameThenPending> {
+        GuardBody::Passthrough(FrameThenPending {
+            first: Full::new(Bytes::from_static(b"chunk")),
+            delivered: false,
+        })
+    }
+
+    #[test]
+    fn frame_then_pending_yields_its_frame_before_stalling() {
+        let mut body = frame_then_pending();
+        let frame = poll_once(&mut body).expect("frame").expect("data");
+        assert_eq!(frame.into_data().expect("data"), &b"chunk"[..]);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected a ready frame")]
+    fn frame_then_pending_poll_panics_once_the_transport_stalls() {
+        let mut body = frame_then_pending();
+        let frame = poll_once(&mut body).expect("frame").expect("data");
+        assert_eq!(frame.into_data().expect("data"), &b"chunk"[..]);
+        // The next poll stalls: `poll_once` panics on the pending transport.
+        let _ = poll_once(&mut body);
+    }
 }

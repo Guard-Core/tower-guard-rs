@@ -432,7 +432,8 @@ mod tests {
     use crate::{
         ACTIVITY_BANNED_MESSAGE, BANNED_MESSAGE, BLOCKED_MESSAGE, FAILURE_MESSAGE,
         FORBIDDEN_MESSAGE, GuardClientIp, IpBanConfig, IpBanManager, IpGateConfig,
-        RATE_LIMITED_MESSAGE, RateLimitConfig, RateLimiter, ThreatBanEntry, default_config,
+        OVERSIZE_MESSAGE, RATE_LIMITED_MESSAGE, RateLimitConfig, RateLimiter, ThreatBanEntry,
+        default_config,
     };
     use guard_core_engine::detect::DetectConfig;
     use guard_core_engine::ip_ban::Clock;
@@ -530,26 +531,70 @@ mod tests {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    /// A body whose single frame is an error: drives the Read arm of the
-    /// buffering loop at the unit level (twin of the integration
-    /// `body_read_error` test, so this binary's copy executes it too).
-    struct ExplodingBody;
+    /// One scripted frame of a [`ScriptedBody`].
+    #[derive(Debug)]
+    enum ScriptedFrame {
+        /// A data frame carrying the buffered bytes.
+        Data(Bytes),
+        /// A trailers frame (no data): the buffering scan skips it.
+        Trailers,
+        /// A transport error: the body stream fails mid-read.
+        Error,
+    }
 
-    impl From<Bytes> for ExplodingBody {
-        fn from(_: Bytes) -> Self {
-            Self
+    /// A request body scripted frame by frame: data, trailers, a transport
+    /// error, or a clean end. One service built over it drives every
+    /// buffering arm and every fail-secure dispatch arm with real inputs.
+    #[derive(Debug)]
+    struct ScriptedBody {
+        frames: std::vec::IntoIter<ScriptedFrame>,
+    }
+
+    impl ScriptedBody {
+        fn scripted(frames: Vec<ScriptedFrame>) -> Self {
+            Self {
+                frames: frames.into_iter(),
+            }
+        }
+
+        /// A single data frame (the ordinary benign request body).
+        fn data(bytes: &[u8]) -> Self {
+            Self::scripted(vec![ScriptedFrame::Data(Bytes::copy_from_slice(bytes))])
+        }
+
+        /// No frames at all: the body buffers to empty.
+        fn empty() -> Self {
+            Self::scripted(Vec::new())
         }
     }
 
-    impl http_body::Body for ExplodingBody {
+    /// The forwarded rebuild: one data frame carrying the buffered bytes.
+    impl From<Bytes> for ScriptedBody {
+        fn from(bytes: Bytes) -> Self {
+            Self::scripted(vec![ScriptedFrame::Data(bytes)])
+        }
+    }
+
+    impl http_body::Body for ScriptedBody {
         type Data = Bytes;
         type Error = String;
 
         fn poll_frame(
-            self: std::pin::Pin<&mut Self>,
+            mut self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
         ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-            Poll::Ready(Some(Err("body exploded".to_owned())))
+            match self.frames.next() {
+                Some(ScriptedFrame::Data(data)) => {
+                    Poll::Ready(Some(Ok(http_body::Frame::data(data))))
+                }
+                Some(ScriptedFrame::Trailers) => {
+                    Poll::Ready(Some(Ok(http_body::Frame::trailers(http::HeaderMap::new()))))
+                }
+                Some(ScriptedFrame::Error) => {
+                    Poll::Ready(Some(Err("body transport failed".to_owned())))
+                }
+                None => Poll::Ready(None),
+            }
         }
     }
 
@@ -564,34 +609,171 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    #[tokio::test]
-    async fn failing_body_fails_secure_with_the_500_shape() {
-        use tower::ServiceExt;
+    /// The real engine scan, except a scan of `/panic-me` explodes: the
+    /// fail-secure arm needs an engine panic injected mid-matrix without
+    /// sacrificing the other arms to an always-panicking scan.
+    fn panic_on_panic_path_scan(
+        surfaces: &guard_core_engine::detection_exclusions::RequestSurfaces<'_>,
+        exclusions: &guard_core_engine::detection_exclusions::ResolvedExclusions,
+        config: &DetectConfig,
+    ) -> guard_core_engine::detection_exclusions::RequestScanVerdict {
+        assert!(surfaces.url_path != Some("/panic-me"), "engine exploded");
+        guard_core_engine::detection_exclusions::scan_request(surfaces, exclusions, config)
+    }
 
-        let layer = GuardLayer::new(default_config());
-        let svc = layer.layer(tower::service_fn(
-            |_request: Request<ExplodingBody>| async move {
-                Ok::<_, Infallible>(
-                    http::Response::builder()
-                        .status(StatusCode::OK)
-                        .body(Full::new(Bytes::from_static(b"unreachable")))
-                        .expect("static response"),
-                )
+    /// The guard over an inner handler that echoes the forwarded body it
+    /// receives (proving the buffered rebuild reached the wrapped service).
+    fn scripted(
+        layer: &GuardLayer,
+    ) -> impl Service<
+        Request<ScriptedBody>,
+        Response = http::Response<crate::GuardBody<Full<Bytes>>>,
+        Error = Infallible,
+    > {
+        layer.layer(tower::service_fn(
+            |request: Request<ScriptedBody>| async move {
+                let bytes = request
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("forwarded body")
+                    .to_bytes();
+                Ok::<_, Infallible>(http::Response::new(Full::new(bytes)))
             },
-        ));
-        let request = Request::builder()
-            .uri("/hello")
-            .body(ExplodingBody)
-            .expect("request");
-        let response = svc.oneshot(request).await.expect("response");
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let bytes = response
-            .into_body()
-            .collect()
+        ))
+    }
+
+    fn scripted_request(ip: &str, uri: &'static str, body: ScriptedBody) -> Request<ScriptedBody> {
+        Request::builder()
+            .uri(uri)
+            .extension(gate_ip(ip))
+            .body(body)
+            .expect("request")
+    }
+
+    /// One guarded request's status and decoded response body.
+    async fn ask(
+        svc: &mut impl Service<
+            Request<ScriptedBody>,
+            Response = http::Response<crate::GuardBody<Full<Bytes>>>,
+            Error = Infallible,
+        >,
+        request: Request<ScriptedBody>,
+    ) -> (StatusCode, String) {
+        let response = svc
+            .ready()
             .await
-            .expect("body")
-            .to_bytes();
-        assert_eq!(&bytes, FAILURE_MESSAGE.as_bytes());
+            .expect("ready")
+            .call(request)
+            .await
+            .expect("response");
+        let status = response.status();
+        (status, body_text(response).await)
+    }
+
+    #[tokio::test]
+    async fn one_scripted_service_exercises_every_call_outcome() {
+        // Every request below flows through this one service instantiation,
+        // so its `call` future and its buffering loop answer for the whole
+        // decision matrix with real inputs.
+        let manager = IpBanManager::new();
+        let config = IpBanConfig::new(true, 100, 3600, no_entries()).expect("valid config");
+        let layer = GuardLayer::new(default_config())
+            .with_body_cap(4)
+            .with_ip_gate(checklist_gate())
+            .with_ip_banning(manager.clone(), config)
+            .with_scan_fn(panic_on_panic_path_scan);
+        let mut svc = scripted(&layer);
+
+        // Benign traffic buffers, scans clean, and forwards the rebuilt body.
+        let (status, body) = ask(
+            &mut svc,
+            scripted_request("203.0.113.61", "/ok", ScriptedBody::data(b"ok")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "ok", "the inner handler echoes the forwarded body");
+
+        // The ban stage answers a live ban before anything downstream.
+        manager
+            .ban_ip(
+                IpAddr::from_str("203.0.113.62").expect("ip"),
+                60,
+                "operator",
+            )
+            .expect("ban");
+        let (status, body) = ask(
+            &mut svc,
+            scripted_request("203.0.113.62", "/ok", ScriptedBody::empty()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, BANNED_MESSAGE);
+
+        // The IP gate denies a blacklisted client before any buffering.
+        let (status, body) = ask(
+            &mut svc,
+            scripted_request("203.0.113.9", "/ok", ScriptedBody::empty()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, FORBIDDEN_MESSAGE);
+
+        // A body over the cap is rejected with 413, never forwarded unscanned.
+        let (status, body) = ask(
+            &mut svc,
+            scripted_request("203.0.113.63", "/ok", ScriptedBody::data(b"0123456789")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body, OVERSIZE_MESSAGE);
+
+        // A body read error fails secure with the 500 shape.
+        let (status, body) = ask(
+            &mut svc,
+            scripted_request(
+                "203.0.113.64",
+                "/ok",
+                ScriptedBody::scripted(vec![ScriptedFrame::Error]),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, FAILURE_MESSAGE);
+
+        // An engine panic on this very path fails secure too.
+        let (status, body) = ask(
+            &mut svc,
+            scripted_request("203.0.113.65", "/panic-me", ScriptedBody::empty()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, FAILURE_MESSAGE);
+
+        // Detection still blocks a flagged path with the plain block shape.
+        // The request carries no client IP, so the stage cannot attribute
+        // the violation and the adapter renders the family block itself.
+        let unattributed_attack = Request::builder()
+            .uri("/files/../../etc/passwd")
+            .body(ScriptedBody::empty())
+            .expect("request");
+        let (status, body) = ask(&mut svc, unattributed_attack).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, BLOCKED_MESSAGE);
+
+        // A trailer-only body buffers to empty and forwards untouched: the
+        // forwarded rebuild carries no buffered bytes.
+        let (status, body) = ask(
+            &mut svc,
+            scripted_request(
+                "203.0.113.67",
+                "/ok",
+                ScriptedBody::scripted(vec![ScriptedFrame::Trailers]),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "", "the forwarded rebuild carries no buffered bytes");
     }
 
     #[tokio::test]
