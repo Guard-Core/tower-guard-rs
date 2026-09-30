@@ -432,13 +432,14 @@ mod tests {
     use crate::{
         ACTIVITY_BANNED_MESSAGE, BANNED_MESSAGE, BLOCKED_MESSAGE, FAILURE_MESSAGE,
         FORBIDDEN_MESSAGE, GuardClientIp, IpBanConfig, IpBanManager, IpGateConfig,
-        RATE_LIMITED_MESSAGE, RateLimitConfig, RateLimiter, ThreatBanEntry, default_config,
+        OVERSIZE_MESSAGE, RATE_LIMITED_MESSAGE, RateLimitConfig, RateLimiter, ThreatBanEntry,
+        default_config,
     };
     use guard_core_engine::detect::DetectConfig;
     use guard_core_engine::ip_ban::Clock;
     use guard_core_engine::ip_gate::IpGateDecision;
     use http::StatusCode;
-    use http_body_util::Full;
+    use http_body_util::{BodyExt, Full};
     use std::convert::Infallible;
     use std::net::IpAddr;
     use std::str::FromStr;
@@ -530,20 +531,272 @@ mod tests {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    /// One scripted frame of a [`ScriptedBody`].
+    #[derive(Debug)]
+    enum ScriptedFrame {
+        /// A data frame carrying the buffered bytes.
+        Data(Bytes),
+        /// A trailers frame (no data): the buffering scan skips it.
+        Trailers,
+        /// A transport error: the body stream fails mid-read.
+        Error,
+    }
+
+    /// A request body scripted frame by frame: data, trailers, a transport
+    /// error, or a clean end. One service built over it drives every
+    /// buffering arm and every fail-secure dispatch arm with real inputs.
+    #[derive(Debug)]
+    struct ScriptedBody {
+        frames: std::vec::IntoIter<ScriptedFrame>,
+    }
+
+    impl ScriptedBody {
+        fn scripted(frames: Vec<ScriptedFrame>) -> Self {
+            Self {
+                frames: frames.into_iter(),
+            }
+        }
+
+        /// A single data frame (the ordinary benign request body).
+        fn data(bytes: &[u8]) -> Self {
+            Self::scripted(vec![ScriptedFrame::Data(Bytes::copy_from_slice(bytes))])
+        }
+
+        /// No frames at all: the body buffers to empty.
+        fn empty() -> Self {
+            Self::scripted(Vec::new())
+        }
+    }
+
+    /// The forwarded rebuild: one data frame carrying the buffered bytes.
+    impl From<Bytes> for ScriptedBody {
+        fn from(bytes: Bytes) -> Self {
+            Self::scripted(vec![ScriptedFrame::Data(bytes)])
+        }
+    }
+
+    impl http_body::Body for ScriptedBody {
+        type Data = Bytes;
+        type Error = String;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            match self.frames.next() {
+                Some(ScriptedFrame::Data(data)) => {
+                    Poll::Ready(Some(Ok(http_body::Frame::data(data))))
+                }
+                Some(ScriptedFrame::Trailers) => {
+                    Poll::Ready(Some(Ok(http_body::Frame::trailers(http::HeaderMap::new()))))
+                }
+                Some(ScriptedFrame::Error) => {
+                    Poll::Ready(Some(Err("body transport failed".to_owned())))
+                }
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversize_body_takes_the_too_large_buffer_arm() {
+        let layer = GuardLayer::new(default_config()).with_body_cap(4);
+        let request = Request::builder()
+            .uri("/hello")
+            .body(Full::new(Bytes::from_static(b"0123456789")))
+            .expect("request");
+        let response = guarded(&layer).oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The real engine scan, except a scan of `/panic-me` explodes: the
+    /// fail-secure arm needs an engine panic injected mid-matrix without
+    /// sacrificing the other arms to an always-panicking scan.
+    fn panic_on_panic_path_scan(
+        surfaces: &guard_core_engine::detection_exclusions::RequestSurfaces<'_>,
+        exclusions: &guard_core_engine::detection_exclusions::ResolvedExclusions,
+        config: &DetectConfig,
+    ) -> guard_core_engine::detection_exclusions::RequestScanVerdict {
+        assert!(surfaces.url_path != Some("/panic-me"), "engine exploded");
+        guard_core_engine::detection_exclusions::scan_request(surfaces, exclusions, config)
+    }
+
+    /// The guard over an inner handler that echoes the forwarded body it
+    /// receives (proving the buffered rebuild reached the wrapped service).
+    fn scripted(
+        layer: &GuardLayer,
+    ) -> impl Service<
+        Request<ScriptedBody>,
+        Response = http::Response<crate::GuardBody<Full<Bytes>>>,
+        Error = Infallible,
+    > {
+        layer.layer(tower::service_fn(
+            |request: Request<ScriptedBody>| async move {
+                let bytes = request
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("forwarded body")
+                    .to_bytes();
+                Ok::<_, Infallible>(http::Response::new(Full::new(bytes)))
+            },
+        ))
+    }
+
+    fn scripted_request(ip: &str, uri: &'static str, body: ScriptedBody) -> Request<ScriptedBody> {
+        Request::builder()
+            .uri(uri)
+            .extension(gate_ip(ip))
+            .body(body)
+            .expect("request")
+    }
+
+    /// One guarded request's status and decoded response body.
+    async fn ask(
+        svc: &mut impl Service<
+            Request<ScriptedBody>,
+            Response = http::Response<crate::GuardBody<Full<Bytes>>>,
+            Error = Infallible,
+        >,
+        request: Request<ScriptedBody>,
+    ) -> (StatusCode, String) {
+        let response = svc
+            .ready()
+            .await
+            .expect("ready")
+            .call(request)
+            .await
+            .expect("response");
+        let status = response.status();
+        (status, body_text(response).await)
+    }
+
+    #[tokio::test]
+    async fn one_scripted_service_exercises_every_call_outcome() {
+        // Every request below flows through this one service instantiation,
+        // so its `call` future and its buffering loop answer for the whole
+        // decision matrix with real inputs.
+        let manager = IpBanManager::new();
+        let config = IpBanConfig::new(true, 100, 3600, no_entries()).expect("valid config");
+        let layer = GuardLayer::new(default_config())
+            .with_body_cap(4)
+            .with_ip_gate(checklist_gate())
+            .with_ip_banning(manager.clone(), config)
+            .with_scan_fn(panic_on_panic_path_scan);
+        let mut svc = scripted(&layer);
+
+        // Benign traffic buffers, scans clean, and forwards the rebuilt body.
+        let (status, body) = ask(
+            &mut svc,
+            scripted_request("203.0.113.61", "/ok", ScriptedBody::data(b"ok")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "ok", "the inner handler echoes the forwarded body");
+
+        // The ban stage answers a live ban before anything downstream.
+        manager
+            .ban_ip(
+                IpAddr::from_str("203.0.113.62").expect("ip"),
+                60,
+                "operator",
+            )
+            .expect("ban");
+        let (status, body) = ask(
+            &mut svc,
+            scripted_request("203.0.113.62", "/ok", ScriptedBody::empty()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, BANNED_MESSAGE);
+
+        // The IP gate denies a blacklisted client before any buffering.
+        let (status, body) = ask(
+            &mut svc,
+            scripted_request("203.0.113.9", "/ok", ScriptedBody::empty()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, FORBIDDEN_MESSAGE);
+
+        // A body over the cap is rejected with 413, never forwarded unscanned.
+        let (status, body) = ask(
+            &mut svc,
+            scripted_request("203.0.113.63", "/ok", ScriptedBody::data(b"0123456789")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body, OVERSIZE_MESSAGE);
+
+        // A body read error fails secure with the 500 shape.
+        let (status, body) = ask(
+            &mut svc,
+            scripted_request(
+                "203.0.113.64",
+                "/ok",
+                ScriptedBody::scripted(vec![ScriptedFrame::Error]),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, FAILURE_MESSAGE);
+
+        // An engine panic on this very path fails secure too.
+        let (status, body) = ask(
+            &mut svc,
+            scripted_request("203.0.113.65", "/panic-me", ScriptedBody::empty()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, FAILURE_MESSAGE);
+
+        // Detection still blocks a flagged path with the plain block shape.
+        // The request carries no client IP, so the stage cannot attribute
+        // the violation and the adapter renders the family block itself.
+        let unattributed_attack = Request::builder()
+            .uri("/files/../../etc/passwd")
+            .body(ScriptedBody::empty())
+            .expect("request");
+        let (status, body) = ask(&mut svc, unattributed_attack).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, BLOCKED_MESSAGE);
+
+        // A trailer-only body buffers to empty and forwards untouched: the
+        // forwarded rebuild carries no buffered bytes.
+        let (status, body) = ask(
+            &mut svc,
+            scripted_request(
+                "203.0.113.67",
+                "/ok",
+                ScriptedBody::scripted(vec![ScriptedFrame::Trailers]),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "", "the forwarded rebuild carries no buffered bytes");
+    }
+
+    #[tokio::test]
+    async fn benign_body_with_user_agent_is_buffered_and_forwarded() {
+        let layer = GuardLayer::new(default_config());
+        let request = Request::builder()
+            .uri("/hello")
+            .header("user-agent", "gap-twin/1.0")
+            .body(Full::new(Bytes::from_static(b"benign body")))
+            .expect("request");
+        let response = guarded(&layer).oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn engine_panic_is_recovered_as_a_500() {
         let layer = GuardLayer::new(default_config()).with_scan_fn(panicking_scan);
-        let service = layer.layer(tower::service_fn(
-            |request: Request<Full<Bytes>>| async move {
-                Ok::<_, Infallible>(Response::new(request.into_body()))
-            },
-        ));
         let request = Request::builder()
             .uri("/hello")
             .body(Full::new(Bytes::from_static(b"ping")))
             .expect("request");
 
-        let response = service.oneshot(request).await.expect("response");
+        let response = guarded(&layer).oneshot(request).await.expect("response");
         assert_eq!(response.status(), 500);
         assert_eq!(body_text(response).await, FAILURE_MESSAGE);
     }
@@ -599,14 +852,11 @@ mod tests {
     #[tokio::test]
     async fn blocked_response_body_reports_the_documented_message() {
         let layer = GuardLayer::new(default_config());
-        let service = layer.layer(tower::service_fn(|_request: Request<Full<Bytes>>| async {
-            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
-        }));
         let request = Request::builder()
             .uri("/files/../../etc/passwd")
             .body(Full::new(Bytes::new()))
             .expect("request");
-        let response = service.oneshot(request).await.expect("response");
+        let response = guarded(&layer).oneshot(request).await.expect("response");
         assert_eq!(response.status(), 400);
         assert_eq!(body_text(response).await, BLOCKED_MESSAGE);
     }
@@ -1362,6 +1612,18 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "the extension tier wins over the resolver"
         );
+        // Without the extension the resolver's looser tier decides.
+        let request = Request::builder()
+            .uri("/tight")
+            .extension(gate_ip("192.0.2.72"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, _, _) = full_status(&layer, request).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the resolver's tier still serves extension-less requests"
+        );
     }
 
     #[tokio::test]
@@ -1720,5 +1982,162 @@ mod tests {
             body, "denied:custom",
             "the live-ban shape takes the override"
         );
+    }
+
+    #[tokio::test]
+    async fn service_debug_renders_the_inner_and_layer() {
+        let layer = GuardLayer::new(default_config());
+        let service = layer.layer(tower::service_fn(
+            |_request: Request<Full<Bytes>>| async move {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+            },
+        ));
+        let rendered = format!("{service:?}");
+        assert!(rendered.starts_with("GuardService"), "{rendered}");
+        // The wrapped service still serves: a benign request passes.
+        let request = Request::builder()
+            .uri("/hello")
+            .extension(gate_ip("192.0.2.85"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn whitelisted_ip_still_gets_the_detection_block_and_payload() {
+        // A whitelisted IP skips the stateful stages, so the stage answers
+        // nothing and the adapter renders the detection block itself,
+        // firing the reference hook payload with the resolved identity.
+        let (payloads, hook) = block_collector();
+        let gate = IpGateConfig::new(["192.0.2.83"], NIL, NIL).expect("valid lists");
+        let layer = GuardLayer::new(default_config())
+            .with_ip_gate(gate)
+            .with_observability(guard_core_rs::tower::ObservabilityConfig::default())
+            .with_on_block(hook);
+        let request = Request::builder()
+            .uri("/files/../../etc/passwd")
+            .extension(gate_ip("192.0.2.83"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, body) = status_and_body(&layer, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "detection never skips");
+        assert_eq!(body, BLOCKED_MESSAGE);
+        let payloads = payloads.lock().expect("payloads");
+        assert_eq!(payloads.len(), 1, "exactly one payload for the block");
+        assert_eq!(payloads[0].check_name, "suspicious_activity");
+        assert_eq!(payloads[0].client_ip, "192.0.2.83");
+        assert_eq!(payloads[0].status_code, Some(400));
+        assert!(!payloads[0].passive_mode);
+    }
+
+    #[tokio::test]
+    async fn valueless_query_parameter_is_benign() {
+        // A query pair without `=` (`?flag`) is a name with an empty value;
+        // it must decode and scan like any other pair, not fall over.
+        let layer = GuardLayer::new(default_config());
+        let request = Request::builder()
+            .uri("/api/items?flag")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, _) = status_and_body(&layer, request).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A body that yields its data frame and then a trailers frame: the
+    /// buffered scan must skip non-data frames instead of failing.
+    #[derive(Debug)]
+    struct TraileredBody {
+        inner: Full<Bytes>,
+        trailers_sent: bool,
+    }
+
+    impl TraileredBody {
+        fn new(bytes: &'static [u8]) -> Self {
+            Self {
+                inner: Full::new(Bytes::from_static(bytes)),
+                trailers_sent: false,
+            }
+        }
+    }
+
+    impl Body for TraileredBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            if !self.inner.is_end_stream() {
+                return Pin::new(&mut self.inner).poll_frame(cx);
+            }
+            if self.trailers_sent {
+                return Poll::Ready(None);
+            }
+            self.trailers_sent = true;
+            Poll::Ready(Some(Ok(http_body::Frame::trailers(http::HeaderMap::new()))))
+        }
+
+        fn is_end_stream(&self) -> bool {
+            false
+        }
+    }
+
+    /// The forwarded rebuild carries only the buffered bytes: the trailers
+    /// were consumed by the buffering scan.
+    impl From<Bytes> for TraileredBody {
+        fn from(bytes: Bytes) -> Self {
+            Self {
+                inner: Full::new(bytes),
+                trailers_sent: true,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn trailers_frames_are_ignored_by_the_buffering_scan() {
+        let layer = GuardLayer::new(default_config());
+        let service = layer.layer(tower::service_fn(
+            |_request: Request<TraileredBody>| async move {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+            },
+        ));
+        let body = TraileredBody::new(b"hello");
+        assert!(!body.is_end_stream(), "data and trailers remain");
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .uri("/submit")
+            .body(body)
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "benign data, benign trailers"
+        );
+    }
+
+    #[tokio::test]
+    async fn distributed_ban_store_wires_into_the_stage() {
+        // The engine's `MemoryStore` speaks both halves of the distributed
+        // seam; installing it as the ban store too must rate limit through
+        // the shared backend.
+        let store = Arc::new(guard_core_engine::distributed::MemoryStore::default());
+        let layer = GuardLayer::new(default_config())
+            .with_rate_limiting(limiter(2, false))
+            .with_distributed_store(
+                Arc::clone(&store) as Arc<dyn guard_core_rs::tower::SlidingWindowStore>,
+                "guard_core:",
+                true,
+            )
+            .with_distributed_ban_store(store as Arc<dyn guard_core_engine::distributed::BanStore>);
+        for _ in 0..2 {
+            let (status, _, _) = full_status(&layer, benign_request("192.0.2.84")).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (status, body, _) = full_status(&layer, benign_request("192.0.2.84")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, RATE_LIMITED_MESSAGE);
     }
 }

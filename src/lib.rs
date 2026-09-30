@@ -800,4 +800,65 @@ mod tests {
         let layer = layer.with_body_cap(1024);
         assert_eq!(layer.body_cap(), 1024);
     }
+
+    #[test]
+    fn with_defaults_uses_the_corpus_config() {
+        let layer = GuardLayer::with_defaults();
+        assert_eq!(layer.body_cap(), 262_144);
+    }
+
+    #[test]
+    fn ban_state_debug_renders_the_manager_and_config() {
+        let entries: Vec<(String, ThreatBanEntry)> = Vec::new();
+        let state = BanState {
+            manager: IpBanManager::new(),
+            counters: ViolationCounters::new(),
+            config: IpBanConfig::new(true, 10, 3600, entries).expect("valid config"),
+        };
+        let rendered = format!("{state:?}");
+        assert!(rendered.starts_with("BanState"), "{rendered}");
+    }
+
+    #[test]
+    fn layer_debug_renders_the_configuration_shape() {
+        let rendered = format!("{:?}", GuardLayer::new(default_config()));
+        assert!(rendered.starts_with("GuardLayer"), "{rendered}");
+        assert!(rendered.contains("body_cap: 262144"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod layer_gap_twins {
+    use super::*;
+    use bytes::Bytes;
+    use http::Request;
+    use http::StatusCode;
+    use http_body_util::Full;
+    use std::convert::Infallible;
+
+    #[tokio::test]
+    async fn layer_builds_the_stage_lazily_on_first_wrap() {
+        // layer() on a fresh GuardLayer takes the `stage.is_none()` arm:
+        // the stage is built once and cached into the wrapped service.
+        let layer = GuardLayer::new(default_config());
+        let mut service = Layer::layer(
+            &layer,
+            tower::service_fn(|_request: Request<Full<Bytes>>| async {
+                Ok::<_, Infallible>(
+                    http::Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from_static(b"ok")))
+                        .expect("static response"),
+                )
+            }),
+        );
+        let request = Request::builder()
+            .uri("/hello")
+            .body(Full::new(Bytes::from_static(b"ping")))
+            .expect("request");
+        let response = tower::Service::call(&mut service, request)
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
