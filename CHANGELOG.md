@@ -2,6 +2,18 @@
 
 All notable changes to this project.
 
+## [Unreleased]
+
+## [1.3.0] - 2026-10-01
+
+### Note
+
+- Trains with the engine: the `guard-core-engine` and `guard-core-rs` floors move to 4.3.0 (the safety-chain release: the full pattern-safety chain, the six pipeline stages' middleware events, the section-08 Redis key schema, the cloud fetchers, and the performance monitor). The adapter ships no logic changes of its own
+
+### Changed
+
+- Process and CI chores: the community and security process scaffold (#21), the 100% line coverage gate enforced with cargo-llvm-cov (#22), the CDLA-Permissive-2.0 license allowed from the engine sibling's graph (#28), and the routine GitHub Actions and crates-group dependency bumps with the lockfile refreshes that keep the sibling graph resolvable (#23-#27, #29-#31)
+
 ## [1.2.0] - 2026-09-27
 
 ### Note
