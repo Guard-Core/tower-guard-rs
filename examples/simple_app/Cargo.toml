@@ -15,7 +15,7 @@ hyper = { version = "1", features = ["http1"] }
 hyper-util = { version = "0.1", features = ["http1", "server", "server-auto", "service", "tokio"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 tower = { version = "0.5", default-features = false }
-tower-guard-rs = { path = "../..", version = "1.2.0" }
+tower-guard-rs = { path = "../..", version = "1.3.0" }
 
 [lints.rust]
 unsafe_code = "forbid"
