@@ -266,19 +266,25 @@ mod tests {
     #[test]
     fn json_string_escapes_the_control_family() {
         assert_eq!(json_string("plain"), "\"plain\"");
-        assert_eq!(json_string("a\"b\\c\nd\te"), "\"a\\\"b\\\\c\\nd\\te\"");
+        assert_eq!(json_string("a\"b\\c\nd\r\te"), "\"a\\\"b\\\\c\\nd\\r\\te\"");
         assert_eq!(json_string("\u{1}"), "\"\\u0001\"");
     }
 
     #[tokio::test]
     async fn service_answers_every_request_with_the_snapshot() {
+        use tower::ServiceExt;
+
         let mut service = GuardStatusService::new(GuardStatus::new().with_geo_configured(true));
         let request = Request::builder()
             .uri("/_guard/status")
             .body(())
             .expect("request");
-        let response =
-            <GuardStatusService as Service<Request<()>>>::call(&mut service, request).await;
+        // poll_ready forwards through (the tower Service contract) before
+        // the call, exactly how a framework router drives the service.
+        let ready = ServiceExt::<Request<()>>::ready(&mut service)
+            .await
+            .expect("ready");
+        let response = ready.call(request).await;
         match response {
             Ok(response) => {
                 assert_eq!(response.status(), StatusCode::OK);
