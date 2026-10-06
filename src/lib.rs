@@ -84,8 +84,31 @@
 //! ban/auto-ban stage (`GuardLayer::with_ip_banning`) skip whitelisted and
 //! exempt IPs for exactly what the reference skips (rate limiting, violation
 //! counting, banning) and never skip detection, which always scans every
-//! request, exempt or not. A user-agent filter and cloud-provider blocking
-//! do not exist yet.
+//! request, exempt or not.
+//!
+//! ## The full stage surface (the reference 17-check pipeline, wired)
+//!
+//! Every reference check the engine ships is now installable on
+//! [`GuardLayer`], and [`GuardService`] runs the installed set in the
+//! reference pipeline order (see the composition table in `docs/` and
+//! [`provided_layers`] for the standalone-layer form):
+//!
+//! | Reference check | Builder |
+//! |---|---|
+//! | 2 `emergency_mode` | [`GuardLayer::with_emergency_mode`] |
+//! | 3 `https_enforcement` | [`GuardLayer::with_https_enforcement`] |
+//! | 4 `request_logging` | [`GuardLayer::with_request_logging`] |
+//! | 5 `request_size_content` | [`GuardLayer::with_body_cap`] (413) |
+//! | 6 + 7 `required_headers` / authentication | [`GuardLayer::with_headers_auth`] |
+//! | 8 referrer | [`GuardLayer::with_referrer_gate`] |
+//! | 9 `custom_validators` | [`GuardLayer::with_custom_checks`] |
+//! | 10 `time_window` | [`GuardLayer::with_time_window_gate`] |
+//! | 12b geo country blocking | [`GuardLayer::with_geo_blocking`] |
+//! | 13 `cloud_provider` | [`GuardLayer::with_cloud_provider`] |
+//! | 14 `user_agent` | [`GuardLayer::with_user_agent`] |
+//! | 12a / 15 / 16 bans / `rate_limit` / detection feed | [`GuardLayer::with_rate_limiting`] + [`GuardLayer::with_ip_banning`] |
+//! | 17 `custom_request` | [`GuardLayer::with_custom_checks`] |
+//! | response pass (return rules + security headers + CORS) | [`GuardLayer::with_response_processor`] |
 //!
 //! These bodies follow the ecosystem's plain-text convention (the bare
 //! message, `text/plain; charset=utf-8`, same as the Python family) but
@@ -143,13 +166,26 @@
 mod body;
 mod response;
 mod service;
+mod stages;
 
+pub use crate::body::{BoxError, GuardBody};
+pub use crate::response::{
+    ACTIVITY_BANNED_MESSAGE, BANNED_MESSAGE, BLOCKED_MESSAGE, FAILURE_MESSAGE, FORBIDDEN_MESSAGE,
+    OVERSIZE_MESSAGE, RATE_LIMITED_MESSAGE,
+};
+pub use crate::service::GuardService;
+pub use crate::stages::{GuardStageLayer, GuardStageService, provided_layers};
+pub use guard_core_engine::behavior::BehaviorRule;
+pub use guard_core_engine::cors::CorsConfig;
 pub use guard_core_engine::detect::{DetectConfig, DetectVerdict, Threat};
 pub use guard_core_engine::detection_exclusions::{
     DetectionExclusionConfig, RouteDetectionExclusions,
 };
 pub use guard_core_engine::distributed::{BanStore, SlidingWindowStore};
 pub use guard_core_engine::geo::GeoIpHandler;
+pub use guard_core_engine::headers_auth::{
+    AuthVerifier, HeaderAuthRules, REQUIRED_SENTINEL, RequiredHeader,
+};
 pub use guard_core_engine::ip_ban::{
     BanError, BanRecord, Clock, IpBanConfig, IpBanConfigError, IpBanManager, ResolvedBan,
     ThreatBanEntry, ViolationCounters,
@@ -161,21 +197,28 @@ pub use guard_core_engine::rate_limit::{
     RateLimitConfig, RateLimitConfigError, RateLimitDecision, RateLimitEntry, RateLimitTier,
     RateLimiter, RouteRateLimits, TierDecision,
 };
+pub use guard_core_engine::security_headers::SecurityHeadersConfig;
+pub use guard_core_rs::cloud_provider::{CloudDecision, CloudProviderStage};
+pub use guard_core_rs::custom_checks::CustomChecksStage;
+pub use guard_core_rs::emergency_mode::{EmergencyAnswer, EmergencyModeStage};
 pub use guard_core_rs::events::SecurityEventBus;
+pub use guard_core_rs::geo::{GeoDecision, GeoStage, GeoStageConfig};
+pub use guard_core_rs::headers_auth::{
+    HeadersAuthStage, RouteGuard, StageAnswer as HeadersAuthAnswer,
+};
+pub use guard_core_rs::https_enforcement::{
+    HttpsEnforcementStage, HttpsRedirectAnswer as HttpsRedirect,
+};
+pub use guard_core_rs::process_response::ResponseProcessor;
+pub use guard_core_rs::request_logging::{RequestLoggingStage, RequestLoggingStageConfig};
 pub use guard_core_rs::responses::{BlockPayload, CustomErrorResponses, OnBlockHook};
+pub use guard_core_rs::route_gates::{GateAnswer, ReferrerStage, TimeWindowStage};
 pub use guard_core_rs::tower::{ObservabilityConfig, RequestObservation, StageResponse};
+pub use guard_core_rs::tower::{RateLimitStage, RateLimitStageConfig, RouteRateResolver};
+pub use guard_core_rs::user_agent::{UserAgentConfigError, UserAgentStage, UserAgentStageConfig};
 use std::net::IpAddr;
 use std::sync::Arc;
 use tower::Layer;
-
-use guard_core_rs::tower::{RateLimitStage, RateLimitStageConfig, RouteRateResolver};
-
-pub use crate::body::{BoxError, GuardBody};
-pub use crate::response::{
-    ACTIVITY_BANNED_MESSAGE, BANNED_MESSAGE, BLOCKED_MESSAGE, FAILURE_MESSAGE, FORBIDDEN_MESSAGE,
-    OVERSIZE_MESSAGE, RATE_LIMITED_MESSAGE,
-};
-pub use crate::service::GuardService;
 
 /// The client IP the IP gate evaluates, carried in request extensions.
 ///
@@ -305,6 +348,30 @@ pub struct GuardLayer {
     distributed_ban_store: Option<Arc<dyn BanStore>>,
     /// The global detection-exclusion config.
     detection_exclusions: Option<DetectionExclusionConfig>,
+    /// Check 2: the emergency-mode stage.
+    emergency_mode: Option<EmergencyModeStage>,
+    /// Check 3: the HTTPS-enforcement stage.
+    https_enforcement: Option<HttpsEnforcementStage>,
+    /// Check 4: the request-logging stage (compose-only, never blocks).
+    request_logging: Option<RequestLoggingStage>,
+    /// Checks 6 + 7: the required-headers and authentication stage.
+    headers_auth: Option<HeadersAuthStage>,
+    /// Check 8: the route referrer gate.
+    referrer_gate: Option<ReferrerStage>,
+    /// Check 9 + 17: the custom-checks stage (validators and the global
+    /// `custom_request` function).
+    custom_checks: Option<CustomChecksStage>,
+    /// Check 10: the route time-window gate.
+    time_window_gate: Option<TimeWindowStage>,
+    /// Check 12b: the geo country-blocking stage.
+    geo_blocking: Option<GeoStage>,
+    /// Check 13: the cloud-provider blocking stage.
+    cloud_provider: Option<CloudProviderStage>,
+    /// Check 14: the blocked user-agent stage.
+    user_agent: Option<UserAgentStage>,
+    /// The response-side pass (behavioral return rules + security headers
+    /// + CORS) applied to every response the guard touches.
+    response_processor: Option<Arc<ResponseProcessor>>,
     /// The scan entry point (test-only panic injection).
     scan_fn: ScanFn,
     /// The stage built by [`GuardLayer::layer`](tower::Layer::layer) from
@@ -337,6 +404,17 @@ impl GuardLayer {
             distributed: None,
             distributed_ban_store: None,
             detection_exclusions: None,
+            emergency_mode: None,
+            https_enforcement: None,
+            request_logging: None,
+            headers_auth: None,
+            referrer_gate: None,
+            custom_checks: None,
+            time_window_gate: None,
+            geo_blocking: None,
+            cloud_provider: None,
+            user_agent: None,
+            response_processor: None,
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
             stage: None,
         }
@@ -641,6 +719,126 @@ impl GuardLayer {
         self
     }
 
+    /// Install the emergency-mode stage (check 2): while the mode is on,
+    /// every IP outside the emergency whitelist answers `503 Service
+    /// temporarily unavailable` before any later stage runs (fail secure:
+    /// an unattributable request is outside the whitelist). Build the
+    /// stage with [`EmergencyModeStage::builder`] so its event bus, hook,
+    /// and custom-error overrides ride along.
+    #[must_use]
+    pub fn with_emergency_mode(mut self, stage: EmergencyModeStage) -> Self {
+        self.emergency_mode = Some(stage);
+        self
+    }
+
+    /// Install the HTTPS-enforcement stage (check 3): a plain-HTTP request
+    /// under the global `enforce_https` arm (or a route's `require_https`)
+    /// answers the reference `301` redirect to the scheme-upgraded URL.
+    #[must_use]
+    pub fn with_https_enforcement(mut self, stage: HttpsEnforcementStage) -> Self {
+        self.https_enforcement = Some(stage);
+        self
+    }
+
+    /// Install the request-logging stage (check 4): composes the reference
+    /// `log_activity` "Request from {ip}: {method} {url}" line (redacted,
+    /// muted-set aware) per request and never blocks. The composed line is
+    /// the host's to emit - install an [`ObservabilityConfig`] for the
+    /// redaction knobs or leave the stage out for silence.
+    #[must_use]
+    pub fn with_request_logging(mut self, stage: RequestLoggingStage) -> Self {
+        self.request_logging = Some(stage);
+        self
+    }
+
+    /// Install the required-headers and authentication stage (checks 6 +
+    /// 7): the route resolver picks the [`RouteGuard`] per path, and a
+    /// failed rule answers the reference dynamic `400` header shape or the
+    /// fixed `401` authentication shape.
+    #[must_use]
+    pub fn with_headers_auth(mut self, stage: HeadersAuthStage) -> Self {
+        self.headers_auth = Some(stage);
+        self
+    }
+
+    /// Install the route referrer gate (check 8): a route with a
+    /// `require_referrer` list answers `403` (`Referrer required` /
+    /// `Invalid referrer`) when the `referer` header is missing or outside
+    /// the allowed domains.
+    #[must_use]
+    pub fn with_referrer_gate(mut self, stage: ReferrerStage) -> Self {
+        self.referrer_gate = Some(stage);
+        self
+    }
+
+    /// Install the custom-checks stage (checks 9 + 17): the route's
+    /// validators run in order (first blocking response wins, the
+    /// validator's own response shape), and the global `custom_request`
+    /// function runs after the rate-limit stage at the reference's
+    /// seventeenth position.
+    #[must_use]
+    pub fn with_custom_checks(mut self, stage: CustomChecksStage) -> Self {
+        self.custom_checks = Some(stage);
+        self
+    }
+
+    /// Install the route time-window gate (check 10): a route with
+    /// `time_restrictions` answers `403` (`Access not allowed at this
+    /// time`) outside the window.
+    #[must_use]
+    pub fn with_time_window_gate(mut self, stage: TimeWindowStage) -> Self {
+        self.time_window_gate = Some(stage);
+        self
+    }
+
+    /// Install the geo country-blocking stage (check 12b, the reference
+    /// runs it inside `ip_security`): a country outside a restrictive
+    /// `whitelist_countries` or inside `blocked_countries` answers `403
+    /// Forbidden`. Resolve countries with an MMDB reader ([`GeoIpHandler`]
+    /// implementations; `guard_core_rs::mmdb` ships one) or any other
+    /// country resolver.
+    #[must_use]
+    pub fn with_geo_blocking(mut self, stage: GeoStage) -> Self {
+        self.geo_blocking = Some(stage);
+        self
+    }
+
+    /// Install the cloud-provider blocking stage (check 13): a client IP
+    /// inside a blocked provider's ranges answers `403` (`Cloud provider
+    /// IP not allowed`). Feed the stage's table with
+    /// [`CloudIpTable::set_provider_ranges`] and refresh it from a
+    /// background fetcher (`guard_core_rs::cloud_fetch`).
+    ///
+    /// [`CloudIpTable`]: guard_core_rs::cloud_provider::CloudIpTable
+    #[must_use]
+    pub fn with_cloud_provider(mut self, stage: CloudProviderStage) -> Self {
+        self.cloud_provider = Some(stage);
+        self
+    }
+
+    /// Install the blocked user-agent stage (check 14): a `User-Agent`
+    /// matching the global blocklist (or the route's) answers `403`
+    /// (`User-Agent not allowed`), and a detection threat on the same
+    /// request feeds the auto-ban engine (the reference
+    /// `escalate_identity_violation`).
+    #[must_use]
+    pub fn with_user_agent(mut self, stage: UserAgentStage) -> Self {
+        self.user_agent = Some(stage);
+        self
+    }
+
+    /// Install the response-side pass (the reference `process_response`):
+    /// the global `return_pattern` behavior rules evaluate every response
+    /// the guard touches (a crossed `ban` action lands in the processor's
+    /// IP-ban store), then the security-header set renders, then the CORS
+    /// verdict headers compose on top. Applied to forwarded responses and
+    /// to every block answer alike.
+    #[must_use]
+    pub fn with_response_processor(mut self, processor: ResponseProcessor) -> Self {
+        self.response_processor = Some(Arc::new(processor));
+        self
+    }
+
     pub(crate) const fn config(&self) -> &DetectConfig {
         &self.config
     }
@@ -667,6 +865,60 @@ impl GuardLayer {
 
     pub(crate) const fn custom_error_responses(&self) -> &CustomErrorResponses {
         &self.custom_error_responses
+    }
+
+    pub(crate) const fn emergency_mode(&self) -> Option<&EmergencyModeStage> {
+        self.emergency_mode.as_ref()
+    }
+
+    pub(crate) const fn https_enforcement(&self) -> Option<&HttpsEnforcementStage> {
+        self.https_enforcement.as_ref()
+    }
+
+    pub(crate) const fn request_logging(&self) -> Option<&RequestLoggingStage> {
+        self.request_logging.as_ref()
+    }
+
+    pub(crate) const fn headers_auth(&self) -> Option<&HeadersAuthStage> {
+        self.headers_auth.as_ref()
+    }
+
+    pub(crate) const fn referrer_gate(&self) -> Option<&ReferrerStage> {
+        self.referrer_gate.as_ref()
+    }
+
+    pub(crate) const fn custom_checks(&self) -> Option<&CustomChecksStage> {
+        self.custom_checks.as_ref()
+    }
+
+    pub(crate) const fn time_window_gate(&self) -> Option<&TimeWindowStage> {
+        self.time_window_gate.as_ref()
+    }
+
+    pub(crate) const fn geo_blocking(&self) -> Option<&GeoStage> {
+        self.geo_blocking.as_ref()
+    }
+
+    pub(crate) const fn cloud_provider(&self) -> Option<&CloudProviderStage> {
+        self.cloud_provider.as_ref()
+    }
+
+    pub(crate) const fn user_agent(&self) -> Option<&UserAgentStage> {
+        self.user_agent.as_ref()
+    }
+
+    pub(crate) const fn response_processor(&self) -> Option<&Arc<ResponseProcessor>> {
+        self.response_processor.as_ref()
+    }
+
+    /// The configured rate-limit stage (built during
+    /// [`GuardLayer::layer`](tower::Layer::layer), or on demand here for
+    /// [`provided_layers`] on a not-yet-wrapped layer).
+    pub(crate) fn rate_limit_stage(&self) -> Option<RateLimitStage> {
+        if let Some(stage) = self.stage.as_deref() {
+            return Some(stage.clone());
+        }
+        (self.rate_limiter.is_some() || self.ban_state.is_some()).then(|| self.build_stage())
     }
 
     /// The installed engine stage (set by
