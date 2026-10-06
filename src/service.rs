@@ -833,6 +833,9 @@ mod tests {
     enum ScriptedFrame {
         /// A data frame carrying the buffered bytes.
         Data(Bytes),
+        /// A pending poll: the buffering loop's await actually suspends
+        /// before the next frame arrives.
+        Pending,
         /// A trailers frame (no data): the buffering scan skips it.
         Trailers,
         /// A transport error: the body stream fails mid-read.
@@ -878,11 +881,18 @@ mod tests {
 
         fn poll_frame(
             mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
+            cx: &mut Context<'_>,
         ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
             match self.frames.next() {
                 Some(ScriptedFrame::Data(data)) => {
                     Poll::Ready(Some(Ok(http_body::Frame::data(data))))
+                }
+                Some(ScriptedFrame::Pending) => {
+                    // The transport is not ready "yet": wake immediately so
+                    // the executor re-drives the future on the next turn and
+                    // the buffering loop's await genuinely suspends once.
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
                 }
                 Some(ScriptedFrame::Trailers) => {
                     Poll::Ready(Some(Ok(http_body::Frame::trailers(http::HeaderMap::new()))))
@@ -1071,6 +1081,24 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "", "the forwarded rebuild carries no buffered bytes");
+
+        // A body whose transport pends once before the data frame: the
+        // buffering loop's await genuinely suspends, then the frame lands
+        // and the request forwards.
+        let (status, body) = ask(
+            &mut svc,
+            scripted_request(
+                "203.0.113.68",
+                "/ok",
+                ScriptedBody::scripted(vec![
+                    ScriptedFrame::Pending,
+                    ScriptedFrame::Data(Bytes::from_static(b"late")),
+                ]),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "late");
     }
 
     #[tokio::test]
