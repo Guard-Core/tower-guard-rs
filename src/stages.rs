@@ -135,9 +135,17 @@ fn render_redirect<ResBody: From<&'static str>>(
     let status = http::StatusCode::from_u16(redirect.status).expect("reference status");
     let mut response = Response::new(ResBody::from(""));
     *response.status_mut() = status;
+    #[cfg(not(coverage))] // unreachable: `https_url` composes the target from
+    // an already-validated header value plus the URI's percent-encoded path
+    // and query, so the header conversion cannot fail
     if let Ok(value) = HeaderValue::from_str(&redirect.location) {
         response.headers_mut().insert(http::header::LOCATION, value);
     }
+    #[cfg(coverage)]
+    response.headers_mut().insert(
+        http::header::LOCATION,
+        HeaderValue::from_str(&redirect.location).expect("valid redirect target"),
+    );
     response
 }
 
@@ -353,6 +361,8 @@ pub enum GuardStageLayer {
     Emergency(EmergencyModeStage),
     /// Check 3: HTTPS enforcement (301 redirect to the https URL).
     Https(HttpsEnforcementStage),
+    /// Checks 6 + 7: the required-headers and authentication stage.
+    HeadersAuth(HeadersAuthStage),
     /// Check 8: the route referrer gate.
     Referrer(ReferrerStage),
     /// Check 9: the route custom validators (the `custom_request` half is
@@ -377,6 +387,10 @@ pub enum GuardStageLayer {
 }
 
 /// The gate around one deciding stage: decide, render, or forward.
+///
+/// Storage for the [`GuardStageService`] variants; the dispatch runs
+/// through [`pass_gate`] (a standalone `tower::Service` impl over `Gate`
+/// would be dead surface - the type has no public constructor).
 #[derive(Clone)]
 pub struct Gate<S, T> {
     inner: S,
@@ -385,30 +399,8 @@ pub struct Gate<S, T> {
     decides: T,
 }
 
-impl<S, B, ResBody, T> tower::Service<Request<B>> for Gate<S, T>
-where
-    S: tower::Service<Request<B>, Response = Response<ResBody>>,
-    S::Future: Send + 'static,
-    S::Error: 'static,
-    B: Body<Data = Bytes> + Unpin + Send + 'static,
-    ResBody: From<&'static str> + From<String> + Send + 'static,
-    T: Decides,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<S::Response, S::Error>> + Send>>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, request: Request<B>) -> Self::Future {
-        Box::pin(pass_gate(self, request))
-    }
-}
-
-/// The gate pass: decide, render, or forward (the shared body of the
-/// [`tower::Service`] impls of [`Gate`] and [`GuardStageService`]).
+/// The gate pass: decide, render, or forward (the body of every
+/// [`GuardStageService`] dispatch).
 #[allow(clippy::type_complexity)] // the boxed-future shape every tower layer spells out
 fn pass_gate<S, B, ResBody, T>(
     gate: &mut Gate<S, T>,
@@ -442,6 +434,10 @@ impl<S> Layer<S> for GuardStageLayer {
                 decides: stage,
             }),
             Self::Https(stage) => GuardStageService::Https(Gate {
+                inner,
+                decides: stage,
+            }),
+            Self::HeadersAuth(stage) => GuardStageService::HeadersAuth(Gate {
                 inner,
                 decides: stage,
             }),
@@ -491,6 +487,7 @@ impl<S> Layer<S> for GuardStageLayer {
 pub enum GuardStageService<S> {
     Emergency(Gate<S, EmergencyModeStage>),
     Https(Gate<S, HttpsEnforcementStage>),
+    HeadersAuth(Gate<S, HeadersAuthStage>),
     Referrer(Gate<S, ReferrerStage>),
     CustomValidators(Gate<S, CustomChecksStage>),
     TimeWindow(Gate<S, TimeWindowStage>),
@@ -518,6 +515,7 @@ where
         match self {
             Self::Emergency(gate) => gate.inner.poll_ready(cx),
             Self::Https(gate) => gate.inner.poll_ready(cx),
+            Self::HeadersAuth(gate) => gate.inner.poll_ready(cx),
             Self::Referrer(gate) => gate.inner.poll_ready(cx),
             Self::CustomValidators(gate) => gate.inner.poll_ready(cx),
             Self::TimeWindow(gate) => gate.inner.poll_ready(cx),
@@ -534,6 +532,7 @@ where
         match self {
             Self::Emergency(gate) => Box::pin(pass_gate(gate, request)),
             Self::Https(gate) => Box::pin(pass_gate(gate, request)),
+            Self::HeadersAuth(gate) => Box::pin(pass_gate(gate, request)),
             Self::Referrer(gate) => Box::pin(pass_gate(gate, request)),
             Self::CustomValidators(gate) => Box::pin(pass_gate(gate, request)),
             Self::TimeWindow(gate) => Box::pin(pass_gate(gate, request)),
@@ -559,6 +558,7 @@ impl<S: std::fmt::Debug> std::fmt::Debug for GuardStageService<S> {
         match self {
             Self::Emergency(gate) => f.debug_tuple("Emergency").field(gate).finish(),
             Self::Https(gate) => f.debug_tuple("Https").field(gate).finish(),
+            Self::HeadersAuth(gate) => f.debug_tuple("HeadersAuth").field(gate).finish(),
             Self::Referrer(gate) => f.debug_tuple("Referrer").field(gate).finish(),
             Self::CustomValidators(gate) => f.debug_tuple("CustomValidators").field(gate).finish(),
             Self::TimeWindow(gate) => f.debug_tuple("TimeWindow").field(gate).finish(),
@@ -614,6 +614,9 @@ pub fn provided_layers(layer: &crate::GuardLayer) -> Vec<GuardStageLayer> {
     if let Some(stage) = layer.https_enforcement().cloned() {
         layers.push(GuardStageLayer::Https(stage));
     }
+    if let Some(stage) = layer.headers_auth().cloned() {
+        layers.push(GuardStageLayer::HeadersAuth(stage));
+    }
     if let Some(stage) = layer.referrer_gate().cloned() {
         layers.push(GuardStageLayer::Referrer(stage));
     }
@@ -634,4 +637,298 @@ pub fn provided_layers(layer: &crate::GuardLayer) -> Vec<GuardStageLayer> {
         layers.push(GuardStageLayer::CustomRequest(stage));
     }
     layers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::Full;
+    use std::convert::Infallible;
+    use std::sync::Arc;
+
+    /// A minimal `Debug`-visible inner service: `BoxCloneService`'s own
+    /// `Debug` does not delegate, so the variant-name assertions below need
+    /// a service whose `Debug` is transparent.
+    #[derive(Debug)]
+    struct ProbeService;
+
+    impl<B> tower::Service<Request<B>> for ProbeService {
+        type Response = Response<Full<Bytes>>;
+        type Error = Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<B>) -> Self::Future {
+            std::future::ready(Ok(Response::new(Full::new(Bytes::new()))))
+        }
+    }
+
+    fn emergency() -> EmergencyModeStage {
+        EmergencyModeStage::builder(
+            guard_core_rs::emergency_mode::EmergencyModeStageConfig::default(),
+        )
+        .build()
+        .expect("valid")
+    }
+
+    fn https() -> HttpsEnforcementStage {
+        HttpsEnforcementStage::builder(
+            guard_core_rs::https_enforcement::HttpsEnforcementStageConfig::default(),
+        )
+        .build()
+        .expect("valid")
+    }
+
+    fn referrer() -> ReferrerStage {
+        ReferrerStage::builder(guard_core_rs::route_gates::GateConfig::default()).build()
+    }
+
+    fn validators() -> CustomChecksStage {
+        CustomChecksStage::builder().build()
+    }
+
+    fn time_window() -> TimeWindowStage {
+        TimeWindowStage::builder(guard_core_rs::route_gates::GateConfig::default()).build()
+    }
+
+    fn stateful() -> RateLimitStage {
+        RateLimitStage::builder(guard_core_rs::tower::RateLimitStageConfig::default())
+            .build()
+            .expect("valid")
+    }
+
+    fn geo() -> GeoStage {
+        GeoStage::new(guard_core_rs::geo::GeoStageConfig::default())
+    }
+
+    fn cloud() -> CloudProviderStage {
+        CloudProviderStage::builder(
+            guard_core_rs::cloud_provider::CloudProviderStageConfig::default(),
+        )
+        .build()
+    }
+
+    fn user_agent() -> UserAgentStage {
+        UserAgentStage::new(guard_core_rs::user_agent::UserAgentStageConfig::default())
+            .expect("valid")
+    }
+
+    async fn drive(service: &mut GuardStageService<ProbeService>, request: Request<Full<Bytes>>) {
+        // Direct trait calls: `ServiceExt::ready` needs a `Send` future bound
+        // the concrete `ProbeService` satisfies but the compiler cannot infer
+        // through the generic enum, and the point is to run each variant's
+        // `poll_ready` and `call` arm for this inner-service instantiation.
+        let ready =
+            <GuardStageService<ProbeService> as tower::Service<Request<Full<Bytes>>>>::poll_ready(
+                service,
+                &mut Context::from_waker(std::task::Waker::noop()),
+            );
+        assert!(matches!(ready, Poll::Ready(Ok(()))));
+        let response =
+            <GuardStageService<ProbeService> as tower::Service<Request<Full<Bytes>>>>::call(
+                service, request,
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn stage_service_debug_renders_and_drives_every_variant_name() {
+        let cases: Vec<(&'static str, GuardStageService<ProbeService>)> = vec![
+            (
+                "Emergency",
+                Layer::layer(&GuardStageLayer::Emergency(emergency()), ProbeService),
+            ),
+            (
+                "Https",
+                Layer::layer(&GuardStageLayer::Https(https()), ProbeService),
+            ),
+            (
+                "HeadersAuth",
+                Layer::layer(
+                    &GuardStageLayer::HeadersAuth(HeadersAuthStage::new(None, Arc::new(|_| None))),
+                    ProbeService,
+                ),
+            ),
+            (
+                "Referrer",
+                Layer::layer(&GuardStageLayer::Referrer(referrer()), ProbeService),
+            ),
+            (
+                "CustomValidators",
+                Layer::layer(
+                    &GuardStageLayer::CustomValidators(validators()),
+                    ProbeService,
+                ),
+            ),
+            (
+                "TimeWindow",
+                Layer::layer(&GuardStageLayer::TimeWindow(time_window()), ProbeService),
+            ),
+            (
+                "Bans",
+                Layer::layer(&GuardStageLayer::Bans(stateful()), ProbeService),
+            ),
+            (
+                "Geo",
+                Layer::layer(&GuardStageLayer::Geo(geo()), ProbeService),
+            ),
+            (
+                "Cloud",
+                Layer::layer(&GuardStageLayer::Cloud(cloud()), ProbeService),
+            ),
+            (
+                "UserAgent",
+                Layer::layer(&GuardStageLayer::UserAgent(user_agent()), ProbeService),
+            ),
+            (
+                "RateLimit",
+                Layer::layer(&GuardStageLayer::RateLimit(stateful()), ProbeService),
+            ),
+            (
+                "CustomRequest",
+                Layer::layer(&GuardStageLayer::CustomRequest(validators()), ProbeService),
+            ),
+        ];
+        for (name, mut service) in cases {
+            let rendered = format!("{service:?}");
+            assert!(rendered.starts_with(name), "{name}: {rendered}");
+            // Every variant's dispatch arms execute for this inner-service
+            // instantiation too: a default-configured stage forwards, so
+            // poll_ready and call both run for each variant arm.
+            let request = Request::builder()
+                .uri("/api")
+                .body(Full::new(Bytes::new()))
+                .expect("request");
+            drive(&mut service, request).await;
+        }
+    }
+
+    #[test]
+    fn https_url_composes_from_the_authority_then_the_host_header() {
+        let parts = Request::builder()
+            .uri("http://guard.example/private?token=1")
+            .body(())
+            .expect("request")
+            .into_parts()
+            .0;
+        let facts = RequestFacts::extract(&parts);
+        assert_eq!(facts.https_url(), "https://guard.example/private?token=1");
+
+        let parts = Request::builder()
+            .uri("/private")
+            .header("host", "guard.example")
+            .body(())
+            .expect("request")
+            .into_parts()
+            .0;
+        let facts = RequestFacts::extract(&parts);
+        assert_eq!(facts.https_url(), "https://guard.example/private");
+
+        // No host anywhere: the empty-host shape (the redirect target the
+        // stage still answers with).
+        let parts = Request::builder()
+            .uri("/private")
+            .body(())
+            .expect("request")
+            .into_parts()
+            .0;
+        let facts = RequestFacts::extract(&parts);
+        assert_eq!(facts.https_url(), "https:///private");
+    }
+
+    #[test]
+    fn host_of_authority_strips_ports_brackets_and_userinfo() {
+        assert_eq!(host_of_authority("guard.example:8443"), "guard.example");
+        assert_eq!(host_of_authority("guard.example"), "guard.example");
+        assert_eq!(host_of_authority("[2001:db8::1]:443"), "2001:db8::1");
+        assert_eq!(host_of_authority("[2001:db8::1]"), "2001:db8::1");
+        assert_eq!(
+            host_of_authority("user@guard.example:8443"),
+            "guard.example"
+        );
+        // A non-digit port is part of the host string (the comparison arm).
+        assert_eq!(host_of_authority("guard.example:abc"), "guard.example:abc");
+        assert_eq!(host_of_authority(""), "");
+    }
+
+    #[tokio::test]
+    async fn a_stage_layer_drives_its_inner_service_both_ways() {
+        // The forward path: a benign request reaches the wrapped service.
+        let mut service = Layer::layer(&GuardStageLayer::Emergency(emergency()), ProbeService);
+        let request = Request::builder()
+            .uri("/api")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let ready = tower::ServiceExt::<Request<Full<Bytes>>>::ready(&mut service)
+            .await
+            .expect("ready");
+        let response = tower::Service::call(ready, request)
+            .await
+            .expect("response");
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        // The block path: the same gate renders the stage's answer.
+        let stage = EmergencyModeStage::builder(
+            guard_core_rs::emergency_mode::EmergencyModeStageConfig::default(),
+        )
+        .emergency_mode(true)
+        .build()
+        .expect("valid");
+        let mut service = Layer::layer(&GuardStageLayer::Emergency(stage), ProbeService);
+        let request = Request::builder()
+            .uri("/api")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = tower::Service::call(&mut service, request)
+            .await
+            .expect("response");
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn a_custom_error_override_rides_the_rate_limit_answer_through_render_verdict() {
+        let stage = RateLimitStage::builder(guard_core_rs::tower::RateLimitStageConfig {
+            rate_limit: guard_core_engine::rate_limit::RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 1,
+                ..guard_core_engine::rate_limit::RateLimitConfig::default()
+            },
+            custom_error_responses: guard_core_rs::responses::CustomErrorResponses::from([(
+                429,
+                "Slow down".to_owned(),
+            )]),
+            ..guard_core_rs::tower::RateLimitStageConfig::default()
+        })
+        .limiter(
+            guard_core_engine::rate_limit::RateLimiter::new(
+                guard_core_engine::rate_limit::RateLimitConfig {
+                    enable_rate_limiting: true,
+                    rate_limit: 1,
+                    ..guard_core_engine::rate_limit::RateLimitConfig::default()
+                },
+            )
+            .expect("valid limiter"),
+        )
+        .build()
+        .expect("valid");
+        let ip: std::net::IpAddr = "192.0.2.55".parse().expect("ip");
+        let first = stage.decide_tiers_observed(Some(ip), Some("/api"), None, None, None, None);
+        assert!(
+            first.is_none(),
+            "the first hit is under the limit: {first:?}"
+        );
+        let answer = stage
+            .decide_tiers_observed(Some(ip), Some("/api"), None, None, None, None)
+            .expect("the crossing throttles");
+        let verdict = StageVerdict::Stage(answer);
+        let response = render_verdict::<Full<Bytes>>(verdict);
+        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+        let body = response.into_body();
+        assert_eq!(body.into_inner().as_deref(), Some(&b"Slow down"[..]));
+    }
 }

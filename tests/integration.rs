@@ -194,8 +194,12 @@ async fn body_under_the_cap_is_forwarded_intact() {
 
 #[tokio::test]
 async fn body_read_error_fails_secure_with_500() {
-    // A body that yields one frame, then errors.
+    // A body that yields one frame, then either errors (the failing script)
+    // or ends cleanly (the forwarded rebuild the guard hands the inner
+    // service - the same type must satisfy the `From<Bytes>` bound).
     struct FailingBody {
+        /// `Some(())` = the failing script; `None` = the clean rebuild.
+        fail: Option<()>,
         yielded: bool,
     }
 
@@ -208,36 +212,58 @@ async fn body_read_error_fails_secure_with_500() {
             _cx: &mut Context<'_>,
         ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
             if self.yielded {
-                return Poll::Ready(Some(Err(io::Error::other("body blew up"))));
+                return match self.fail {
+                    Some(()) => Poll::Ready(Some(Err(io::Error::other("body blew up")))),
+                    None => Poll::Ready(None),
+                };
             }
             self.yielded = true;
             Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"hi")))))
         }
     }
 
-    // Required by the `Service` bounds; never reached because the body errors.
+    // The forwarded rebuild: one clean data frame, then a clean end.
     impl From<Bytes> for FailingBody {
         fn from(_bytes: Bytes) -> Self {
-            Self { yielded: false }
+            Self {
+                fail: None,
+                yielded: false,
+            }
         }
     }
 
     let service = GuardLayer::new(default_config()).layer(BoxCloneService::new(tower::service_fn(
         |_request: Request<FailingBody>| async {
-            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
-                b"never reached",
-            ))))
+            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"forwarded"))))
         },
     )));
+
+    // The failing script: the read error fails secure with the 500 shape.
     let request = Request::builder()
         .method(Method::POST)
         .uri("/api/items")
-        .body(FailingBody { yielded: false })
+        .body(FailingBody {
+            fail: Some(()),
+            yielded: false,
+        })
         .expect("request");
-
-    let response = service.oneshot(request).await.expect("response");
+    let response = service.clone().oneshot(request).await.expect("response");
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body_text(response).await, FAILURE_MESSAGE);
+
+    // The clean rebuild through the same service instantiation: the buffered
+    // body scans, forwards, and the inner handler answers.
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/items")
+        .body(FailingBody {
+            fail: None,
+            yielded: false,
+        })
+        .expect("request");
+    let response = service.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "forwarded");
 }
 
 #[tokio::test]
@@ -888,6 +914,7 @@ async fn provided_layers_lists_the_installed_stages_in_reference_order() {
         .map(|stage| match stage {
             GuardStageLayer::Emergency(_) => "emergency",
             GuardStageLayer::Https(_) => "https",
+            GuardStageLayer::HeadersAuth(_) => "headers_auth",
             GuardStageLayer::Referrer(_) => "referrer",
             GuardStageLayer::CustomValidators(_) => "validators",
             GuardStageLayer::TimeWindow(_) => "time_window",
@@ -967,4 +994,698 @@ async fn route_tiers_still_apply_over_the_new_stages() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+// ===================================================================
+// The standalone stage layers: each `GuardStageLayer` variant wraps a
+// service through the `provided_layers` shape and answers the reference
+// block, or forwards untouched.
+// ===================================================================
+
+use tower_guard_rs::{GuardStageLayer, provided_layers};
+
+type StageSvc = BoxCloneService<Request<Full<Bytes>>, Response<Full<Bytes>>, Infallible>;
+
+fn wrapped(stage: &GuardStageLayer) -> StageSvc {
+    BoxCloneService::new(Layer::layer(stage, echo()))
+}
+
+fn emergency_layer() -> GuardStageLayer {
+    GuardStageLayer::Emergency(
+        EmergencyModeStage::builder(
+            guard_core_rs::emergency_mode::EmergencyModeStageConfig::default(),
+        )
+        .emergency_mode(true)
+        .emergency_whitelist(["203.0.113.9"])
+        .build()
+        .expect("valid whitelist"),
+    )
+}
+
+fn https_layer() -> GuardStageLayer {
+    GuardStageLayer::Https(
+        HttpsEnforcementStage::builder(HttpsEnforcementStageConfig::default())
+            .enforce_https(true)
+            .build()
+            .expect("valid"),
+    )
+}
+
+fn headers_auth_layer() -> GuardStageLayer {
+    GuardStageLayer::HeadersAuth(HeadersAuthStage::new(
+        None,
+        Arc::new(|path: &str| {
+            (path == "/private").then(|| {
+                Arc::new(RouteGuard {
+                    rules: HeaderAuthRules {
+                        required_headers: vec![RequiredHeader {
+                            name: String::from("x-api-key"),
+                            expected: String::from(REQUIRED_SENTINEL),
+                        }],
+                        ..HeaderAuthRules::default()
+                    },
+                    verifier: None,
+                    api_key_verifier: None,
+                })
+            })
+        }),
+    ))
+}
+
+fn referrer_layer() -> GuardStageLayer {
+    GuardStageLayer::Referrer(
+        ReferrerStage::builder(GateConfig::default())
+            .resolver(Arc::new(|path: &str| {
+                (path == "/gated").then(|| vec![String::from("https://good.example")])
+            }))
+            .build(),
+    )
+}
+
+fn validators_layer() -> GuardStageLayer {
+    GuardStageLayer::CustomValidators(
+        CustomChecksStage::builder()
+            .validators_resolver(Arc::new(|path: &str| {
+                (path == "/private").then(|| {
+                    vec![(
+                        String::from("post_only"),
+                        Arc::new(
+                            |ctx: &guard_core_engine::custom_checks::CustomRequestContext<'_>| {
+                                (ctx.method != "POST").then_some(ValidatorAnswer::Response(
+                                    CustomResponse { status: Some(403) },
+                                ))
+                            },
+                        )
+                            as guard_core_engine::custom_checks::CustomValidatorFn,
+                    )]
+                })
+            }))
+            .build(),
+    )
+}
+
+fn time_window_layer() -> GuardStageLayer {
+    let now = chrono::Utc::now();
+    let start = (now + chrono::Duration::minutes(2))
+        .format("%H:%M")
+        .to_string();
+    let end = (now + chrono::Duration::minutes(3))
+        .format("%H:%M")
+        .to_string();
+    GuardStageLayer::TimeWindow(
+        TimeWindowStage::builder(GateConfig::default())
+            .resolver(Arc::new(move |path: &str| {
+                (path == "/nightly").then(|| guard_core_engine::time_window::TimeWindow {
+                    start: Some(start.clone()),
+                    end: Some(end.clone()),
+                    timezone: Some(String::from("UTC")),
+                })
+            }))
+            .build(),
+    )
+}
+
+fn bans_layer(manager: &IpBanManager) -> GuardStageLayer {
+    let stage = tower_guard_rs::RateLimitStage::builder(tower_guard_rs::RateLimitStageConfig {
+        ip_ban: IpBanConfig::new(
+            true,
+            10,
+            3600,
+            [] as [(String, tower_guard_rs::ThreatBanEntry); 0],
+        )
+        .expect("valid"),
+        ..tower_guard_rs::RateLimitStageConfig::default()
+    })
+    .ban_manager(manager.clone(), tower_guard_rs::ViolationCounters::new())
+    .build()
+    .expect("valid stage");
+    GuardStageLayer::Bans(stage)
+}
+
+fn geo_layer() -> GuardStageLayer {
+    GuardStageLayer::Geo(GeoStage::new(GeoStageConfig {
+        gate: parse_country_lists(Vec::<String>::new(), ["US"]),
+        handler: Some(Arc::new(UnitedStates)),
+        passive_mode: false,
+    }))
+}
+
+fn cloud_layer() -> GuardStageLayer {
+    let table = CloudIpTable::default();
+    table
+        .set_provider_ranges("AWS", vec![(String::from("192.0.2.0/24"), None)])
+        .expect("valid ranges");
+    GuardStageLayer::Cloud(
+        guard_core_rs::cloud_provider::CloudProviderStage::builder(
+            guard_core_rs::cloud_provider::CloudProviderStageConfig {
+                block_cloud_providers: parse_cloud_selectors(["AWS"]).expect("valid selectors"),
+                table,
+                passive_mode: false,
+            },
+        )
+        .build(),
+    )
+}
+
+fn user_agent_layer() -> GuardStageLayer {
+    GuardStageLayer::UserAgent(
+        UserAgentStage::new(UserAgentStageConfig {
+            blocked_user_agents: guard_core_rs::user_agent::UserAgentFilter::new(["bad-bot"])
+                .expect("valid patterns"),
+            ..UserAgentStageConfig::default()
+        })
+        .expect("valid config"),
+    )
+}
+
+fn rate_limit_layer() -> GuardStageLayer {
+    GuardStageLayer::RateLimit(
+        tower_guard_rs::RateLimitStage::builder(tower_guard_rs::RateLimitStageConfig {
+            rate_limit: tower_guard_rs::RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 1,
+                rate_limit_window: 60,
+                ..tower_guard_rs::RateLimitConfig::default()
+            },
+            ..tower_guard_rs::RateLimitStageConfig::default()
+        })
+        .limiter(
+            tower_guard_rs::RateLimiter::new(tower_guard_rs::RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 1,
+                rate_limit_window: 60,
+                ..tower_guard_rs::RateLimitConfig::default()
+            })
+            .expect("valid limiter"),
+        )
+        .build()
+        .expect("valid stage"),
+    )
+}
+
+fn custom_request_layer() -> GuardStageLayer {
+    GuardStageLayer::CustomRequest(
+        CustomChecksStage::builder()
+            .custom_request(
+                "maintenance_gate",
+                Arc::new(|ctx| {
+                    (ctx.path == "/admin").then_some(CustomResponse { status: Some(503) })
+                }),
+            )
+            .build(),
+    )
+}
+
+#[tokio::test]
+async fn standalone_emergency_layer_blocks_outside_the_whitelist_and_forwards_inside() {
+    let service = wrapped(&emergency_layer());
+
+    let response = service
+        .clone()
+        .oneshot(attributed_get("/api", "192.0.2.7"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body_text(response).await, "Service temporarily unavailable");
+
+    let response = service
+        .oneshot(attributed_get("/api", "203.0.113.9"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn standalone_https_layer_redirects_and_strips_ports_and_brackets() {
+    let service = wrapped(&https_layer());
+
+    // A host header with a port: the redirect target keeps the bare host.
+    let request = Request::builder()
+        .uri("/private?token=1")
+        .header("host", "guard.example:8443")
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = service.clone().oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::LOCATION)
+            .expect("location"),
+        "https://guard.example:8443/private?token=1",
+        "the redirect target carries the host as sent; the port strip feeds
+        the trusted-proxy comparison only"
+    );
+
+    // An absolute-form URI takes the host from the authority.
+    let request = Request::builder()
+        .uri("http://[2001:db8::1]/private")
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = service.clone().oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::LOCATION)
+            .expect("location"),
+        "https://[2001:db8::1]/private"
+    );
+
+    // An https request forwards untouched.
+    let request = Request::builder()
+        .uri("https://guard.example/private")
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = service.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn standalone_headers_auth_layer_blocks_without_the_header_and_forwards_with_it() {
+    let service = wrapped(&headers_auth_layer());
+
+    let response = service
+        .clone()
+        .oneshot(get("/private"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let request = Request::builder()
+        .uri("/private")
+        .header("x-api-key", "present")
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = service.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn standalone_referrer_layer_blocks_and_forwards() {
+    let service = wrapped(&referrer_layer());
+
+    let response = service
+        .clone()
+        .oneshot(get("/gated"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_text(response).await, "Referrer required");
+
+    let request = Request::builder()
+        .uri("/gated")
+        .header("referer", "https://good.example/page")
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = service.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn standalone_validators_layer_blocks_with_the_validator_status_and_forwards() {
+    let service = wrapped(&validators_layer());
+
+    let response = service
+        .clone()
+        .oneshot(get("/private"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let response = service
+        .oneshot(post("/private", "{}"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn standalone_time_window_layer_blocks_outside_the_window_and_forwards_inside() {
+    let service = wrapped(&time_window_layer());
+
+    let response = service
+        .clone()
+        .oneshot(get("/nightly"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_text(response).await, "Access not allowed at this time");
+
+    let response = service.oneshot(get("/open")).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn standalone_bans_layer_blocks_a_banned_ip_and_forwards_the_rest() {
+    let manager = IpBanManager::new();
+    manager
+        .ban_ip(IpAddr::from_str("192.0.2.55").expect("ip"), 60, "operator")
+        .expect("ban");
+    let service = wrapped(&bans_layer(&manager));
+
+    let response = service
+        .clone()
+        .oneshot(attributed_get("/api", "192.0.2.55"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_text(response).await, "IP address banned");
+
+    let response = service
+        .oneshot(attributed_get("/api", "192.0.2.56"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn standalone_geo_layer_blocks_and_forwards() {
+    let service = wrapped(&geo_layer());
+
+    let response = service
+        .clone()
+        .oneshot(attributed_get("/api", "192.0.2.9"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_text(response).await, "Forbidden");
+
+    let response = service.oneshot(get("/api")).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK, "unattributed forwards");
+}
+
+#[tokio::test]
+async fn standalone_cloud_layer_blocks_and_forwards() {
+    let service = wrapped(&cloud_layer());
+
+    let response = service
+        .clone()
+        .oneshot(attributed_get("/api", "192.0.2.9"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_text(response).await, "Cloud provider IP not allowed");
+
+    let response = service
+        .oneshot(attributed_get("/api", "198.51.100.9"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn standalone_user_agent_layer_blocks_and_forwards() {
+    let service = wrapped(&user_agent_layer());
+
+    let request = Request::builder()
+        .uri("/api")
+        .header("user-agent", "bad-bot/1.0")
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = service.clone().oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_text(response).await, "User-Agent not allowed");
+
+    let request = Request::builder()
+        .uri("/api")
+        .header("user-agent", "friendly-crawler/2.0")
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = service.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn standalone_rate_limit_layer_throttles_with_retry_after() {
+    let service = wrapped(&rate_limit_layer());
+
+    let response = service
+        .clone()
+        .oneshot(attributed_get("/api", "192.0.2.55"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = service
+        .oneshot(attributed_get("/api", "192.0.2.55"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::RETRY_AFTER)
+            .expect("retry-after"),
+        "60"
+    );
+    assert_eq!(body_text(response).await, "Too many requests");
+}
+
+#[tokio::test]
+async fn standalone_rate_limit_layer_renders_the_custom_error_override() {
+    let stage = tower_guard_rs::RateLimitStage::builder(tower_guard_rs::RateLimitStageConfig {
+        rate_limit: tower_guard_rs::RateLimitConfig {
+            enable_rate_limiting: true,
+            rate_limit: 1,
+            rate_limit_window: 60,
+            ..tower_guard_rs::RateLimitConfig::default()
+        },
+        custom_error_responses: tower_guard_rs::CustomErrorResponses::from([(
+            429,
+            String::from("Slow down"),
+        )]),
+        ..tower_guard_rs::RateLimitStageConfig::default()
+    })
+    .limiter(
+        tower_guard_rs::RateLimiter::new(tower_guard_rs::RateLimitConfig {
+            enable_rate_limiting: true,
+            rate_limit: 1,
+            rate_limit_window: 60,
+            ..tower_guard_rs::RateLimitConfig::default()
+        })
+        .expect("valid limiter"),
+    )
+    .build()
+    .expect("valid stage");
+    let service = wrapped(&GuardStageLayer::RateLimit(stage));
+
+    let response = service
+        .clone()
+        .oneshot(attributed_get("/api", "192.0.2.55"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = service
+        .oneshot(attributed_get("/api", "192.0.2.55"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body_text(response).await, "Slow down");
+}
+
+#[tokio::test]
+async fn standalone_custom_request_layer_blocks_with_status_and_forwards() {
+    let service = wrapped(&custom_request_layer());
+
+    let response = service
+        .clone()
+        .oneshot(get("/admin"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let response = service.oneshot(get("/public")).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn provided_layers_full_surface_lists_every_stage_in_reference_order() {
+    let layer = GuardLayer::new(default_config())
+        .with_emergency_mode(match emergency_layer() {
+            GuardStageLayer::Emergency(stage) => stage,
+            _ => unreachable!("fixture shape"),
+        })
+        .with_https_enforcement(match https_layer() {
+            GuardStageLayer::Https(stage) => stage,
+            _ => unreachable!("fixture shape"),
+        })
+        .with_headers_auth(match headers_auth_layer() {
+            GuardStageLayer::HeadersAuth(stage) => stage,
+            _ => unreachable!("fixture shape"),
+        })
+        .with_referrer_gate(match referrer_layer() {
+            GuardStageLayer::Referrer(stage) => stage,
+            _ => unreachable!("fixture shape"),
+        })
+        .with_custom_checks(match validators_layer() {
+            GuardStageLayer::CustomValidators(stage) => stage,
+            _ => unreachable!("fixture shape"),
+        })
+        .with_time_window_gate(match time_window_layer() {
+            GuardStageLayer::TimeWindow(stage) => stage,
+            _ => unreachable!("fixture shape"),
+        })
+        .with_geo_blocking(match geo_layer() {
+            GuardStageLayer::Geo(stage) => stage,
+            _ => unreachable!("fixture shape"),
+        })
+        .with_cloud_provider(match cloud_layer() {
+            GuardStageLayer::Cloud(stage) => stage,
+            _ => unreachable!("fixture shape"),
+        })
+        .with_user_agent(match user_agent_layer() {
+            GuardStageLayer::UserAgent(stage) => stage,
+            _ => unreachable!("fixture shape"),
+        })
+        .with_rate_limiting(
+            tower_guard_rs::RateLimiter::new(tower_guard_rs::RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 5,
+                ..tower_guard_rs::RateLimitConfig::default()
+            })
+            .expect("valid limiter"),
+        );
+
+    let layers = provided_layers(&layer);
+    let names: Vec<&'static str> = layers
+        .iter()
+        .map(|stage| match stage {
+            GuardStageLayer::Emergency(_) => "emergency",
+            GuardStageLayer::Https(_) => "https",
+            GuardStageLayer::HeadersAuth(_) => "headers_auth",
+            GuardStageLayer::Referrer(_) => "referrer",
+            GuardStageLayer::CustomValidators(_) => "validators",
+            GuardStageLayer::TimeWindow(_) => "time_window",
+            GuardStageLayer::Bans(_) => "bans",
+            GuardStageLayer::Geo(_) => "geo",
+            GuardStageLayer::Cloud(_) => "cloud",
+            GuardStageLayer::UserAgent(_) => "user_agent",
+            GuardStageLayer::RateLimit(_) => "rate_limit",
+            GuardStageLayer::CustomRequest(_) => "custom_request",
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "emergency",
+            "https",
+            "headers_auth",
+            "referrer",
+            "validators",
+            "time_window",
+            "bans",
+            "geo",
+            "cloud",
+            "user_agent",
+            "rate_limit",
+            "custom_request",
+        ],
+        "the reference pipeline order with every stage installed"
+    );
+}
+
+#[tokio::test]
+async fn provided_layers_without_stateful_stages_still_lists_the_middle_stages() {
+    let layer = GuardLayer::new(default_config())
+        .with_geo_blocking(match geo_layer() {
+            GuardStageLayer::Geo(stage) => stage,
+            _ => unreachable!("fixture shape"),
+        })
+        .with_cloud_provider(match cloud_layer() {
+            GuardStageLayer::Cloud(stage) => stage,
+            _ => unreachable!("fixture shape"),
+        })
+        .with_user_agent(match user_agent_layer() {
+            GuardStageLayer::UserAgent(stage) => stage,
+            _ => unreachable!("fixture shape"),
+        });
+
+    let names: Vec<&'static str> = provided_layers(&layer)
+        .iter()
+        .map(|stage| match stage {
+            GuardStageLayer::Geo(_) => "geo",
+            GuardStageLayer::Cloud(_) => "cloud",
+            GuardStageLayer::UserAgent(_) => "user_agent",
+            _ => unreachable!("unexpected stage"),
+        })
+        .collect();
+    assert_eq!(names, vec!["geo", "cloud", "user_agent"]);
+}
+
+// -------------------------------------------------------------------
+// Fused-pass arms the stage wiring added: the request-logging compose
+// and the trusted-proxy host forms.
+// -------------------------------------------------------------------
+
+#[tokio::test]
+async fn request_logging_stage_composes_and_never_blocks() {
+    let stage =
+        tower_guard_rs::RequestLoggingStage::new(tower_guard_rs::RequestLoggingStageConfig {
+            log_request_level: Some(guard_core_rs::logging::LogLevel::Info),
+            ..tower_guard_rs::RequestLoggingStageConfig::default()
+        });
+    assert!(stage.exists(), "the reference construction gate");
+    let service = GuardLayer::new(default_config())
+        .with_request_logging(stage)
+        .layer(echo());
+
+    // The stage composes a line (the host's to emit) and never blocks.
+    let response = service
+        .clone()
+        .oneshot(attributed_get("/api", "192.0.2.9"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // An attack still blocks through the same pipeline.
+    let response = service
+        .oneshot(post("/api/comment", "<script>alert(1)</script>"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_text(response).await, BLOCKED_MESSAGE);
+}
+
+#[tokio::test]
+async fn https_enforcement_host_forms_feed_the_trusted_proxy_comparison() {
+    let stage = HttpsEnforcementStage::builder(HttpsEnforcementStageConfig::default())
+        .enforce_https(true)
+        .build()
+        .expect("valid");
+    let service = GuardLayer::new(default_config())
+        .with_https_enforcement(stage)
+        .layer(echo());
+
+    // A host header with a port: the redirect target keeps the host as
+    // sent; the port strip feeds the trusted-proxy comparison only.
+    let request = Request::builder()
+        .uri("/private")
+        .header("host", "guard.example:8443")
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = service.clone().oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::LOCATION)
+            .expect("location"),
+        "https://guard.example:8443/private"
+    );
+
+    // A bracketed IPv6 authority survives verbatim in the target.
+    let request = Request::builder()
+        .uri("http://[2001:db8::1]:8443/private")
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = service.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::LOCATION)
+            .expect("location"),
+        "https://[2001:db8::1]:8443/private"
+    );
 }

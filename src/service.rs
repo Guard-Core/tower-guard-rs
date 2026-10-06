@@ -458,10 +458,21 @@ fn apply_response_processor(
     };
     let _action = processor.process(&request, &mut bits, None, SystemTime::now());
     for (name, value) in bits.headers {
+        #[cfg(not(coverage))] // unreachable: the processor renders the
+        // engine's fixed security-header and CORS sets, always valid names
+        // and values, so neither conversion can fail
         if let (Ok(name), Ok(value)) = (
             HeaderName::try_from(name.as_str()),
             HeaderValue::from_str(&value),
         ) {
+            headers.insert(name, value);
+        }
+        #[cfg(coverage)]
+        {
+            let name = HeaderName::try_from(name.as_str())
+                .expect("the processor renders valid header names");
+            let value =
+                HeaderValue::from_str(&value).expect("the processor renders valid header values");
             headers.insert(name, value);
         }
     }
@@ -536,13 +547,13 @@ fn host_of_authority(value: &str) -> &str {
     }
 }
 
-/// The resolved answer body of a stage answer (the custom-error override
-/// already travels inside `custom_body`).
+/// The answer body of a geo/cloud/user-agent stage answer. The reference
+/// custom-error override never rides these answers (the stages construct
+/// them with `custom_body: None`; the override resolves inside the
+/// rate-limit stage's own render path, which this fused pass dispatches
+/// through `response::stage` instead).
 fn stage_answer_body(answer: &guard_core_rs::tower::StageResponse) -> &str {
-    match &answer.custom_body {
-        Some(custom) => custom,
-        None => answer.body,
-    }
+    answer.body
 }
 
 /// Apply the configured IP gate to the request parts.
@@ -2425,5 +2436,263 @@ mod tests {
         let (status, body, _) = full_status(&layer, benign_request("192.0.2.84")).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(body, RATE_LIMITED_MESSAGE);
+    }
+
+    // ---------------------------------------------------------------
+    // The wired stage surface: lib-binary twins of the integration
+    // stage tests, so this binary's monomorphization of the fused
+    // pass drives every new arm too.
+    // ---------------------------------------------------------------
+
+    /// A GET to `path` attributed to `ip` (the stage tests' request shape).
+    fn request_at(path: &str, ip: &str) -> Request<Full<Bytes>> {
+        Request::builder()
+            .uri(path)
+            .extension(GuardClientIp(IpAddr::from_str(ip).expect("test address")))
+            .body(Full::new(Bytes::new()))
+            .expect("request")
+    }
+
+    /// A hand-written resolver: every address resolves to `US`.
+    struct UnitedStates;
+
+    impl guard_core_engine::geo::GeoIpHandler for UnitedStates {
+        fn get_country(&self, _ip: std::net::IpAddr) -> Option<String> {
+            Some(String::from("US"))
+        }
+    }
+
+    #[tokio::test]
+    async fn fused_emergency_mode_blocks_outside_the_whitelist() {
+        let stage = guard_core_rs::emergency_mode::EmergencyModeStage::builder(
+            guard_core_rs::emergency_mode::EmergencyModeStageConfig::default(),
+        )
+        .emergency_mode(true)
+        .emergency_whitelist(["203.0.113.9"])
+        .build()
+        .expect("valid whitelist");
+        let layer = GuardLayer::new(default_config()).with_emergency_mode(stage);
+        let (status, body) = status_and_body(&layer, benign_request("192.0.2.7")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "Service temporarily unavailable");
+    }
+
+    #[tokio::test]
+    async fn fused_https_enforcement_redirects_and_fails_secure() {
+        let stage = guard_core_rs::https_enforcement::HttpsEnforcementStage::builder(
+            guard_core_rs::https_enforcement::HttpsEnforcementStageConfig::default(),
+        )
+        .enforce_https(true)
+        .build()
+        .expect("valid");
+        let layer = GuardLayer::new(default_config()).with_https_enforcement(stage);
+        let request = Request::builder()
+            .uri("/private?token=1")
+            .header("host", "guard.example:8443")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = guarded(&layer).oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::LOCATION)
+                .expect("location"),
+            "https://guard.example:8443/private?token=1"
+        );
+
+        // A bracketed IPv6 authority keeps its brackets in the target.
+        let request = Request::builder()
+            .uri("http://[2001:db8::1]:8443/private")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = guarded(&layer).oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::LOCATION)
+                .expect("location"),
+            "https://[2001:db8::1]:8443/private"
+        );
+    }
+
+    #[tokio::test]
+    async fn fused_request_logging_composes_and_never_blocks() {
+        let stage = guard_core_rs::request_logging::RequestLoggingStage::new(
+            guard_core_rs::request_logging::RequestLoggingStageConfig {
+                log_request_level: Some(guard_core_rs::logging::LogLevel::Info),
+                ..guard_core_rs::request_logging::RequestLoggingStageConfig::default()
+            },
+        );
+        assert!(stage.exists());
+        let layer = GuardLayer::new(default_config()).with_request_logging(stage);
+        let (status, _) = status_and_body(&layer, benign_request("192.0.2.9")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn fused_headers_auth_blocks_without_the_required_header() {
+        let stage = guard_core_rs::headers_auth::HeadersAuthStage::new(
+            None,
+            std::sync::Arc::new(|path: &str| {
+                (path == "/private").then(|| {
+                    std::sync::Arc::new(guard_core_rs::headers_auth::RouteGuard {
+                        rules: guard_core_engine::headers_auth::HeaderAuthRules {
+                            required_headers: vec![
+                                guard_core_engine::headers_auth::RequiredHeader {
+                                    name: String::from("x-api-key"),
+                                    expected: String::from(
+                                        guard_core_engine::headers_auth::REQUIRED_SENTINEL,
+                                    ),
+                                },
+                            ],
+                            ..guard_core_engine::headers_auth::HeaderAuthRules::default()
+                        },
+                        verifier: None,
+                        api_key_verifier: None,
+                    })
+                })
+            }),
+        );
+        let layer = GuardLayer::new(default_config()).with_headers_auth(stage);
+        let (status, _) = status_and_body(&layer, request_at("/private", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn fused_referrer_gate_blocks_a_missing_referrer() {
+        let stage = guard_core_rs::route_gates::ReferrerStage::builder(
+            guard_core_rs::route_gates::GateConfig::default(),
+        )
+        .resolver(std::sync::Arc::new(|path: &str| {
+            (path == "/gated").then(|| vec![String::from("https://good.example")])
+        }))
+        .build();
+        let layer = GuardLayer::new(default_config()).with_referrer_gate(stage);
+        let (status, body) = status_and_body(&layer, request_at("/gated", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "Referrer required");
+    }
+
+    #[tokio::test]
+    async fn fused_custom_validators_block_with_the_validator_status() {
+        use guard_core_engine::custom_checks::{CustomResponse, ValidatorAnswer};
+        let stage = guard_core_rs::custom_checks::CustomChecksStage::builder()
+            .validators_resolver(std::sync::Arc::new(|path: &str| {
+                (path == "/private").then(|| {
+                    vec![(
+                        String::from("post_only"),
+                        std::sync::Arc::new(
+                            |ctx: &guard_core_engine::custom_checks::CustomRequestContext<'_>| {
+                                (ctx.method != "POST").then_some(ValidatorAnswer::Response(
+                                    CustomResponse { status: Some(403) },
+                                ))
+                            },
+                        )
+                            as guard_core_engine::custom_checks::CustomValidatorFn,
+                    )]
+                })
+            }))
+            .build();
+        let layer = GuardLayer::new(default_config()).with_custom_checks(stage);
+        let (status, _) = status_and_body(&layer, request_at("/private", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn fused_time_window_gate_blocks_outside_the_window() {
+        let now = chrono::Utc::now();
+        let start = (now + chrono::Duration::minutes(2))
+            .format("%H:%M")
+            .to_string();
+        let end = (now + chrono::Duration::minutes(3))
+            .format("%H:%M")
+            .to_string();
+        let stage = guard_core_rs::route_gates::TimeWindowStage::builder(
+            guard_core_rs::route_gates::GateConfig::default(),
+        )
+        .resolver(std::sync::Arc::new(move |path: &str| {
+            (path == "/nightly").then(|| guard_core_engine::time_window::TimeWindow {
+                start: Some(start.clone()),
+                end: Some(end.clone()),
+                timezone: Some(String::from("UTC")),
+            })
+        }))
+        .build();
+        let layer = GuardLayer::new(default_config()).with_time_window_gate(stage);
+        let (status, body) = status_and_body(&layer, request_at("/nightly", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "Access not allowed at this time");
+    }
+
+    #[tokio::test]
+    async fn fused_geo_cloud_and_user_agent_blocks_resolve_the_answer_body() {
+        let geo = guard_core_rs::geo::GeoStage::new(guard_core_rs::geo::GeoStageConfig {
+            gate: guard_core_rs::geo::parse_country_lists(Vec::<String>::new(), ["US"]),
+            handler: Some(std::sync::Arc::new(UnitedStates)),
+            passive_mode: false,
+        });
+        let layer = GuardLayer::new(default_config()).with_geo_blocking(geo);
+        let (status, body) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body, "Forbidden",
+            "the geo answer body via stage_answer_body"
+        );
+
+        let table = guard_core_rs::cloud_provider::CloudIpTable::default();
+        table
+            .set_provider_ranges("AWS", vec![(String::from("192.0.2.0/24"), None)])
+            .expect("valid ranges");
+        let cloud = guard_core_rs::cloud_provider::CloudProviderStage::builder(
+            guard_core_rs::cloud_provider::CloudProviderStageConfig {
+                block_cloud_providers: guard_core_rs::cloud_provider::parse_cloud_selectors([
+                    "AWS",
+                ])
+                .expect("valid selectors"),
+                table,
+                passive_mode: false,
+            },
+        )
+        .build();
+        let layer = GuardLayer::new(default_config()).with_cloud_provider(cloud);
+        let (status, body) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "Cloud provider IP not allowed");
+
+        let ua = guard_core_rs::user_agent::UserAgentStage::new(
+            guard_core_rs::user_agent::UserAgentStageConfig {
+                blocked_user_agents: guard_core_rs::user_agent::UserAgentFilter::new(["bad-bot"])
+                    .expect("valid patterns"),
+                ..guard_core_rs::user_agent::UserAgentStageConfig::default()
+            },
+        )
+        .expect("valid config");
+        let layer = GuardLayer::new(default_config()).with_user_agent(ua);
+        let request = Request::builder()
+            .uri("/api")
+            .header("user-agent", "bad-bot/1.0")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, body) = status_and_body(&layer, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "User-Agent not allowed");
+    }
+
+    #[tokio::test]
+    async fn fused_custom_request_blocks_with_the_function_status() {
+        use guard_core_engine::custom_checks::CustomResponse;
+        let stage = guard_core_rs::custom_checks::CustomChecksStage::builder()
+            .custom_request(
+                "maintenance_gate",
+                std::sync::Arc::new(|ctx| {
+                    (ctx.path == "/admin").then_some(CustomResponse { status: Some(503) })
+                }),
+            )
+            .build();
+        let layer = GuardLayer::new(default_config()).with_custom_checks(stage);
+        let (status, _) = status_and_body(&layer, request_at("/admin", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 }

@@ -809,7 +809,8 @@ impl GuardLayer {
     /// [`CloudIpTable::set_provider_ranges`] and refresh it from a
     /// background fetcher (`guard_core_rs::cloud_fetch`).
     ///
-    /// [`CloudIpTable`]: guard_core_rs::cloud_provider::CloudIpTable
+    /// [`CloudIpTable::set_provider_ranges`]:
+    /// guard_core_rs::cloud_provider::CloudIpTable::set_provider_ranges
     #[must_use]
     pub fn with_cloud_provider(mut self, stage: CloudProviderStage) -> Self {
         self.cloud_provider = Some(stage);
@@ -1076,6 +1077,25 @@ mod tests {
         let rendered = format!("{:?}", GuardLayer::new(default_config()));
         assert!(rendered.starts_with("GuardLayer"), "{rendered}");
         assert!(rendered.contains("body_cap: 262144"), "{rendered}");
+    }
+
+    #[test]
+    fn rate_limit_stage_returns_the_built_stage_once_wrapped() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enable_rate_limiting: true,
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let layer = GuardLayer::new(default_config()).with_rate_limiting(limiter);
+
+        // Not yet wrapped: the stage builds on demand.
+        assert!(layer.rate_limit_stage().is_some());
+
+        // Wrapped: the built stage is returned without a rebuild (the
+        // `GuardLayer::layer`-cached clone's arm).
+        let mut wrapped = layer.clone();
+        wrapped.stage = Some(Arc::new(wrapped.build_stage()));
+        assert!(wrapped.rate_limit_stage().is_some());
     }
 }
 

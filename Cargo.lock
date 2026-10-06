@@ -351,6 +351,7 @@ dependencies = [
  "guard-core-engine",
  "html-escape",
  "http",
+ "regex",
  "serde_json",
  "tower",
  "ureq",
