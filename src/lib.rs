@@ -144,6 +144,8 @@ mod body;
 mod response;
 mod service;
 
+pub mod status;
+
 pub use guard_core_engine::detect::{DetectConfig, DetectVerdict, Threat};
 pub use guard_core_engine::detection_exclusions::{
     DetectionExclusionConfig, RouteDetectionExclusions,
