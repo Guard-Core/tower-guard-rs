@@ -168,6 +168,8 @@ mod response;
 mod service;
 mod stages;
 
+pub mod status;
+
 pub use crate::body::{BoxError, GuardBody};
 pub use crate::response::{
     ACTIVITY_BANNED_MESSAGE, BANNED_MESSAGE, BLOCKED_MESSAGE, FAILURE_MESSAGE, FORBIDDEN_MESSAGE,

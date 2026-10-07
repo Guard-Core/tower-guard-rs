@@ -87,6 +87,14 @@ let layer = tower_guard_rs::GuardLayer::new(tower_guard_rs::default_config())
 
 A body larger than the cap is rejected with `413` rather than forwarded unscanned: the engine would only ever see a truncated prefix, which would be a bypass vector.
 
+## Status route
+
+`status::GuardStatusService::new(GuardStatus::new().with_cloud_table(table))` is the `add_status_route` mirror (fastapi-guard `guard/status.py` + `HandlerInitializer.get_initialization_status`): a plain tower service answering every request with the initialization snapshot, so the host framework routes it wherever the family default `/_guard/status` (`status::DEFAULT_STATUS_PATH`) belongs. The payload carries the cloud-provider readiness table (`{"ready":...}` per provider from the live `CloudIpTable`) and the geo-ip component (`null` without a handler, `{"configured":true}` with one). The Rust engine tracks cloud readiness only, so the `entries`/`last_refreshed` keys the Python family serves have no counterpart here; the payload is rendered per request from in-memory state with no dependency added. axum applications get the mounted route through `axum-guard-rs`'s `status::status_router`.
+
+## WebSocket upgrades
+
+WebSocket upgrades are not guarded by this adapter. A tower service sees the upgrade request like any other, but the upgrade itself completes at the hyper connection level (hyper's `on_upgrade` runtime), outside the `tower::Service` contract this crate is written against - there is no framework surface here to reject a handshake with the reference's close shapes. The guard exists where the framework exposes the upgrade: axum applications use [`axum-guard-rs`](https://github.com/rennf93/axum-guard-rs)'s `websocket::WebSocketGuard` (1008 policy / 1013 try-again-later close semantics, 403 pre-accept), and actix Web applications use `actix-guard-rs`'s `websocket::WebSocketGuard`. Plain requests (upgrade or not) still pass through this crate's checks as always.
+
 ## Engine dependency
 
 The Cargo.toml pins `guard-core-engine` and `guard-core-rs` at 4.2.0 and carries paths pointing at the sibling `guard-core-rs` checkout (`../guard-core-rs/crates/guard-core-engine`, `../guard-core-rs/crates/guard-core-rs`) so local builds and CI compile the engine from source. Registry note, stated plainly: the 4.1.0 dists were yanked (the version-accuracy fix for the family tag mistake), so the 1.1.0 of this crate could not resolve its engine from the registry alone; the synchronized 4.2.0 train restores resolution (`tower-guard-rs` 1.2.0 over `guard-core-engine`/`guard-core-rs` 4.2.0). CI checks out `rennf93/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `laravel-guard`/`symfony-guard`.
