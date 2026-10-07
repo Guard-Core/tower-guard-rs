@@ -305,6 +305,117 @@ async fn inner_service_errors_are_propagated_not_swallowed() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+// Per-binary twins: the integration group's private copy of the fused
+// pipeline also runs the ip-gate verdict arms (allowed-with-decision and
+// denied-403) that the standalone gate layer tests cover elsewhere.
+#[tokio::test]
+async fn ip_gate_allows_the_whitelisted_and_denies_the_blacklisted() {
+    let gate_for = |whitelist: bool| {
+        if whitelist {
+            tower_guard_rs::IpGateConfig::new(
+                ["192.0.2.7"] as [&str; 1],
+                [] as [&str; 0],
+                [] as [&str; 0],
+            )
+            .expect("valid lists")
+        } else {
+            tower_guard_rs::IpGateConfig::new(
+                [] as [&str; 0],
+                ["192.0.2.9"] as [&str; 1],
+                [] as [&str; 0],
+            )
+            .expect("valid lists")
+        }
+    };
+
+    // A whitelisted IP passes with the gate decision inserted: the allowed
+    // arm runs and the inner handler answers.
+    let request = Request::builder()
+        .uri("/hello")
+        .extension(tower_guard_rs::GuardClientIp(
+            "192.0.2.7".parse().expect("ip"),
+        ))
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = GuardLayer::new(default_config())
+        .with_ip_gate(gate_for(true))
+        .layer(echo())
+        .oneshot(request)
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // A blacklisted exact IP is denied with the family 403.
+    let request = Request::builder()
+        .uri("/hello")
+        .extension(tower_guard_rs::GuardClientIp(
+            "192.0.2.9".parse().expect("ip"),
+        ))
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = GuardLayer::new(default_config())
+        .with_ip_gate(gate_for(false))
+        .layer(echo())
+        .oneshot(request)
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn detection_block_fires_the_hook_payload_with_observability() {
+    // The detection block through the plain Full-body instantiation with
+    // observability installed: the hook fires with the resolved identity
+    // and the answer renders the family block shape.
+    let payloads: std::sync::Arc<std::sync::Mutex<Vec<guard_core_rs::responses::BlockPayload>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&payloads);
+    let hook: guard_core_rs::responses::OnBlockHook =
+        std::sync::Arc::new(move |payload| sink.lock().expect("payloads").push(payload.clone()));
+    let service = GuardLayer::new(default_config())
+        .with_observability(guard_core_rs::tower::ObservabilityConfig::default())
+        .with_on_block(hook)
+        .layer(echo());
+    let request = Request::builder()
+        .uri("/files/../../etc/passwd")
+        .extension(tower_guard_rs::GuardClientIp(
+            "203.0.113.20".parse().expect("ip"),
+        ))
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = service.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_text(response).await, BLOCKED_MESSAGE);
+    let fired = payloads.lock().expect("payloads");
+    assert_eq!(fired.len(), 1, "the hook fires once");
+    assert_eq!(fired[0].check_name, "suspicious_activity");
+}
+
+#[tokio::test]
+async fn unattributed_detection_block_fires_the_hook_payload() {
+    // The detection block for a request with no resolvable client IP: the
+    // adapter renders the family block itself and fires the hook payload
+    // (the reference's unattributed path) with observability installed.
+    let payloads: std::sync::Arc<std::sync::Mutex<Vec<guard_core_rs::responses::BlockPayload>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&payloads);
+    let hook: guard_core_rs::responses::OnBlockHook =
+        std::sync::Arc::new(move |payload| sink.lock().expect("payloads").push(payload.clone()));
+    let service = GuardLayer::new(default_config())
+        .with_observability(guard_core_rs::tower::ObservabilityConfig::default())
+        .with_on_block(hook)
+        .layer(echo());
+    let response = service
+        .oneshot(get("/files/../../etc/passwd"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_text(response).await, BLOCKED_MESSAGE);
+    let fired = payloads.lock().expect("payloads");
+    assert_eq!(fired.len(), 1, "the hook fires once");
+    assert_eq!(fired[0].check_name, "suspicious_activity");
+}
+
 #[tokio::test]
 async fn concurrent_requests_are_screened_independently() {
     let service = GuardLayer::new(default_config()).layer(echo());

@@ -2585,6 +2585,22 @@ mod tests {
                 .expect("location"),
             "https://[2001:db8::1]:8443/private"
         );
+
+        // A plain-host authority with a numeric port strips the port: the
+        // host:port arm of the authority parser, on this instantiation.
+        let request = Request::builder()
+            .uri("http://guard.example:8443/private")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = guarded(&layer).oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::LOCATION)
+                .expect("location"),
+            "https://guard.example:8443/private"
+        );
     }
 
     #[tokio::test]
@@ -2598,6 +2614,83 @@ mod tests {
         assert!(stage.exists());
         let layer = GuardLayer::new(default_config()).with_request_logging(stage);
         let (status, _) = status_and_body(&layer, benign_request("192.0.2.9")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // Per-binary twin: the plain-inner instantiation also runs the response
+    // processor's pass (return rules, security headers, CORS) and the
+    // inner-error propagation, so this binary's private copy of the fused
+    // pipeline covers the forward tail the scripted instantiation covers.
+    #[tokio::test]
+    async fn response_processor_and_inner_error_through_the_plain_inner() {
+        let processor = guard_core_rs::process_response::ResponseProcessor::new(
+            Some(guard_core_engine::security_headers::SecurityHeadersConfig::reference_default()),
+            None,
+            Vec::new(),
+            Arc::new(Mutex::new(
+                guard_core_engine::behavior::BehaviorTracker::new(),
+            )),
+            IpBanManager::new(),
+            true,
+            262_144,
+            false,
+        );
+        let layer = GuardLayer::new(default_config()).with_response_processor(processor);
+        let (status, _) = status_and_body(&layer, benign_request("192.0.2.88")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The inner-service error path on the same instantiation: the error
+        // propagates after the response pass, never swallowed.
+        let failing = GuardLayer::new(default_config()).layer(tower::service_fn(
+            |_request: Request<Full<Bytes>>| async {
+                Err::<Response<Full<Bytes>>, _>(std::io::Error::other("down"))
+            },
+        ));
+        let error = failing
+            .clone()
+            .oneshot(benign_request("192.0.2.88"))
+            .await
+            .expect_err("inner error must propagate");
+        assert_eq!(error.to_string(), "down");
+    }
+
+    #[tokio::test]
+    async fn fused_headers_auth_passes_with_the_required_header() {
+        let stage = guard_core_rs::headers_auth::HeadersAuthStage::new(
+            None,
+            std::sync::Arc::new(|path: &str| {
+                (path == "/private").then(|| {
+                    std::sync::Arc::new(guard_core_rs::headers_auth::RouteGuard {
+                        rules: guard_core_engine::headers_auth::HeaderAuthRules {
+                            required_headers: vec![
+                                guard_core_engine::headers_auth::RequiredHeader {
+                                    name: String::from("x-api-key"),
+                                    expected: String::from(
+                                        guard_core_engine::headers_auth::REQUIRED_SENTINEL,
+                                    ),
+                                },
+                            ],
+                            ..guard_core_engine::headers_auth::HeaderAuthRules::default()
+                        },
+                        verifier: None,
+                        api_key_verifier: None,
+                    })
+                })
+            }),
+        );
+        let layer = GuardLayer::new(default_config()).with_headers_auth(stage);
+        // The passing case: the required header rides the request, the gate
+        // falls through, and the inner handler answers.
+        let request = Request::builder()
+            .uri("/private")
+            .header(
+                "x-api-key",
+                guard_core_engine::headers_auth::REQUIRED_SENTINEL,
+            )
+            .extension(gate_ip("192.0.2.9"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, _) = status_and_body(&layer, request).await;
         assert_eq!(status, StatusCode::OK);
     }
 
