@@ -128,6 +128,13 @@ where
             let (mut parts, mut body) = request.into_parts();
             let facts = RequestFacts::extract(&parts);
 
+            // The reference `exclude_paths` carve-out runs first: the
+            // docs/static paths bypass the whole pipeline (exact path
+            // match), detection included.
+            if layer.exclude_paths.contains(&facts.path) {
+                return forward(&layer, &facts, parts, None, inner).await;
+            }
+
             // The IP gate runs before anything else: a denied IP must not
             // cost a body buffer, and detection still scans whatever passes.
             if let Some(denial) = enforce_ip_gate(&mut parts, &layer) {
@@ -582,8 +589,54 @@ fn enforce_ip_gate(parts: &mut Parts, layer: &GuardLayer) -> Option<Response<Ful
             parts.extensions.insert(decision);
             None
         }
-        IpGateVerdict::Denied(_) => Some(response::forbidden()),
+        IpGateVerdict::Denied(denial) => {
+            // The reference ip_filter block path: passive mode logs the
+            // crossing and forwards (no gate decision reaches the rest of
+            // the pipeline, so the unattributed handling applies), the
+            // `on_block` hook fires once with the reference payload keys,
+            // and the custom-error body override wins over the family
+            // default.
+            if layer.passive_mode {
+                return None;
+            }
+            let ip_string = ip.to_string();
+            let body = resolve_error_body(
+                layer.custom_error_responses(),
+                403,
+                response::FORBIDDEN_MESSAGE,
+            );
+            if let Some(observability) = layer.observability() {
+                let observation = request_observation(parts);
+                let payload = build_block_payload(
+                    "ip_security",
+                    &format!("IP address blocked: {ip_string}"),
+                    denial.reason(),
+                    false,
+                    &ip_string,
+                    observation.url.as_deref().unwrap_or("/"),
+                    observation.method.as_deref().unwrap_or(""),
+                    Some(403),
+                    &observability.sensitive,
+                );
+                fire_block_hook(layer.on_block(), &payload);
+            }
+            Some(block_response_owned(parts, layer, 403, &body))
+        }
     }
+}
+
+/// [`block_response`] with an owned (custom-resolved) body: the same
+/// response-side pass, one allocation.
+fn block_response_owned(
+    parts: &Parts,
+    layer: &GuardLayer,
+    status: u16,
+    body: &str,
+) -> Response<Full<Bytes>> {
+    let mut generated = response::blocked_with_body(status, body);
+    let input = ProcessorInput::from_parts(parts);
+    apply_response_processor(layer, &input, status, generated.headers_mut());
+    generated
 }
 
 /// Buffer a request body up to `cap` bytes.
@@ -825,6 +878,288 @@ mod tests {
             .extension(gate_ip(ip))
             .body(Full::new(Bytes::new()))
             .expect("request")
+    }
+
+    // --- the unified SecurityConfig consumption (from_security_config) ---
+
+    use guard_core_engine::security_config::SecurityConfig;
+
+    async fn config_status_and_body(
+        config: &SecurityConfig,
+        request: Request<Full<Bytes>>,
+    ) -> (StatusCode, String) {
+        let layer = GuardLayer::from_security_config(config).expect("valid config");
+        status_and_body(&layer, request).await
+    }
+
+    #[tokio::test]
+    async fn from_security_config_defaults_screen_clean_traffic() {
+        let config = SecurityConfig::default();
+        let (status, _) = config_status_and_body(&config, benign_request("203.0.113.9")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn from_security_config_enforce_https_redirects_http() {
+        let config = SecurityConfig {
+            enforce_https: true,
+            ..SecurityConfig::default()
+        };
+        let (status, body) = config_status_and_body(&config, benign_request("203.0.113.9")).await;
+        assert_eq!(status.as_u16(), 301);
+        assert!(
+            body.is_empty(),
+            "the reference redirect carries no body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_security_config_emergency_mode_blocks_outside_the_whitelist() {
+        let config = SecurityConfig {
+            emergency_mode: true,
+            emergency_whitelist: vec![String::from("198.51.100.7")],
+            ..SecurityConfig::default()
+        };
+        let (blocked, _) = config_status_and_body(&config, benign_request("203.0.113.9")).await;
+        assert_eq!(blocked, StatusCode::SERVICE_UNAVAILABLE);
+        let (allowed, _) = config_status_and_body(&config, benign_request("198.51.100.7")).await;
+        assert_eq!(allowed, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn from_security_config_blocked_user_agent_answers_the_403() {
+        let config = SecurityConfig {
+            blocked_user_agents: vec![String::from("bad-bot")],
+            ..SecurityConfig::default()
+        };
+        let mut request = benign_request("203.0.113.9");
+        request
+            .headers_mut()
+            .insert("user-agent", http::HeaderValue::from_static("bad-bot/1.0"));
+        let (blocked, body) = config_status_and_body(&config, request).await;
+        assert_eq!(blocked, StatusCode::FORBIDDEN);
+        assert_eq!(body, "User-Agent not allowed");
+
+        let (allowed, _) = config_status_and_body(&config, benign_request("203.0.113.9")).await;
+        assert_eq!(allowed, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn from_security_config_exclude_paths_bypass_the_pipeline() {
+        let config = SecurityConfig {
+            blacklist: vec![String::from("203.0.113.9")],
+            exclude_paths: vec![String::from("/docs")],
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        let mut docs = benign_request("203.0.113.9");
+        *docs.uri_mut() = http::Uri::from_static("/docs");
+        let (bypassed, _) = status_and_body(&layer, docs).await;
+        assert_eq!(bypassed, StatusCode::OK);
+        let (blocked, _) = status_and_body(&layer, benign_request("203.0.113.9")).await;
+        assert_eq!(blocked, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn from_security_config_invalid_ip_list_entry_fails_closed() {
+        let config = SecurityConfig {
+            whitelist: Some(vec![String::from("not-an-ip")]),
+            ..SecurityConfig::default()
+        };
+        let error = GuardLayer::from_security_config(&config).unwrap_err();
+        assert!(matches!(error, crate::GuardConfigError::IpGate(_)));
+    }
+
+    #[tokio::test]
+    async fn from_security_config_rate_limit_crossing_answers_429() {
+        let config = SecurityConfig {
+            rate_limit: 1,
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        let (first, _) = status_and_body(&layer, benign_request("203.0.113.9")).await;
+        assert_eq!(first, StatusCode::OK);
+        let (second, body) = status_and_body(&layer, benign_request("203.0.113.9")).await;
+        assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, RATE_LIMITED_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn from_security_config_custom_error_responses_render() {
+        let config = SecurityConfig {
+            blacklist: vec![String::from("203.0.113.9")],
+            custom_error_responses: {
+                let mut map = std::collections::BTreeMap::new();
+                map.insert(403, String::from("custom-forbidden"));
+                map
+            },
+            ..SecurityConfig::default()
+        };
+        let (status, body) = config_status_and_body(&config, benign_request("203.0.113.9")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "custom-forbidden");
+    }
+
+    #[tokio::test]
+    async fn from_security_config_passive_mode_observes_without_blocking() {
+        let config = SecurityConfig {
+            passive_mode: true,
+            blacklist: vec![String::from("203.0.113.9")],
+            ..SecurityConfig::default()
+        };
+        let (status, _) = config_status_and_body(&config, benign_request("203.0.113.9")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn from_security_config_security_headers_render_on_responses() {
+        let config = SecurityConfig::default();
+        let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        let response = guarded(&layer)
+            .oneshot(benign_request("203.0.113.9"))
+            .await
+            .expect("response");
+        assert_eq!(
+            response.headers().get("x-content-type-options"),
+            Some(&http::HeaderValue::from_static("nosniff"))
+        );
+    }
+
+    #[tokio::test]
+    async fn from_security_config_cors_config_enables_the_cors_response_headers() {
+        let config = SecurityConfig {
+            enable_cors: true,
+            cors_allow_origins: vec![String::from("https://app.test")],
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        let mut request = benign_request("203.0.113.9");
+        request
+            .headers_mut()
+            .insert("origin", http::HeaderValue::from_static("https://app.test"));
+        let response = guarded(&layer).oneshot(request).await.expect("response");
+        assert_eq!(
+            response.headers().get("access-control-allow-origin"),
+            Some(&http::HeaderValue::from_static("https://app.test"))
+        );
+    }
+
+    #[tokio::test]
+    async fn from_security_config_disable_rate_limiting_forwards_freely() {
+        let config = SecurityConfig {
+            enable_rate_limiting: false,
+            rate_limit: 1,
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        for _ in 0..3 {
+            let (status, _) = status_and_body(&layer, benign_request("203.0.113.9")).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+    }
+
+    #[test]
+    fn from_security_config_zero_rate_limit_fails_closed() {
+        let config = SecurityConfig {
+            rate_limit: 0,
+            ..SecurityConfig::default()
+        };
+        let error = GuardLayer::from_security_config(&config).unwrap_err();
+        assert!(matches!(error, crate::GuardConfigError::RateLimit(_)));
+    }
+
+    #[tokio::test]
+    async fn from_security_config_disable_ip_banning_still_screens() {
+        let config = SecurityConfig {
+            enable_ip_banning: false,
+            blacklist: vec![String::from("203.0.113.9")],
+            ..SecurityConfig::default()
+        };
+        let (status, _) = config_status_and_body(&config, benign_request("203.0.113.9")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn from_security_config_detection_exclusions_and_categories_reach_the_scan() {
+        let config = SecurityConfig {
+            enabled_detection_categories: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("xss"));
+                set
+            },
+            excluded_detection_params: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("q"));
+                set
+            },
+            detection_scan_body: false,
+            ..SecurityConfig::default()
+        };
+        // The sqli category is disabled by the enabled-categories override:
+        // the sqli probe forwards.
+        let mut sqli = benign_request("203.0.113.9");
+        *sqli.uri_mut() = http::Uri::from_static("/hello?q=1%27+OR+1%3D1");
+        let (status, _) = config_status_and_body(&config, sqli).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn from_security_config_silent_observability_skips_the_knob() {
+        let config = SecurityConfig {
+            log_suspicious_level: None,
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        assert!(layer.observability().is_none());
+    }
+
+    #[tokio::test]
+    async fn from_security_config_disabled_security_headers_skip_the_processor() {
+        let config = SecurityConfig {
+            security_headers: guard_core_engine::security_headers::SecurityHeadersConfig {
+                enabled: false,
+                ..guard_core_engine::security_headers::SecurityHeadersConfig::reference_default()
+            },
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        let response = guarded(&layer)
+            .oneshot(benign_request("203.0.113.9"))
+            .await
+            .expect("response");
+        assert_eq!(response.headers().get("x-content-type-options"), None);
+    }
+
+    #[tokio::test]
+    async fn from_security_config_empty_category_set_skips_the_exclusion_block() {
+        // The reference's empty `enabled_detection_categories` frozenset:
+        // an explicitly empty set disables every category, and the
+        // detection-exclusion block is not installed at all.
+        let config = SecurityConfig {
+            enabled_detection_categories: std::collections::BTreeSet::new(),
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        assert!(layer.detection_exclusions().is_none());
+    }
+
+    #[tokio::test]
+    async fn from_security_config_on_block_hook_fires_once() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let config = SecurityConfig {
+            blacklist: vec![String::from("203.0.113.9")],
+            on_block: Some(Arc::new(move |payload: &crate::BlockPayload| {
+                sink.lock().expect("sink").push(payload.check_name.clone());
+            })),
+            ..SecurityConfig::default()
+        };
+        let (status, _) = config_status_and_body(&config, benign_request("203.0.113.9")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            !seen.lock().expect("sink").is_empty(),
+            "the reference on_block hook fires per blocked request"
+        );
     }
 
     async fn body_text(response: Response<GuardBody<Full<Bytes>>>) -> String {

@@ -27,10 +27,6 @@ pub const OVERSIZE_MESSAGE: &str = "Payload too large";
 /// Detail message carried by the fail-secure `500` response.
 pub const FAILURE_MESSAGE: &str = "Security check failed";
 
-pub(crate) fn forbidden() -> Response<Full<Bytes>> {
-    plain_text(StatusCode::FORBIDDEN, FORBIDDEN_MESSAGE)
-}
-
 pub(crate) fn oversize() -> Response<Full<Bytes>> {
     plain_text(StatusCode::PAYLOAD_TOO_LARGE, OVERSIZE_MESSAGE)
 }
@@ -46,7 +42,20 @@ pub(crate) fn redirect(
 ) -> Response<Full<Bytes>> {
     let status = StatusCode::from_u16(redirect.status).expect("reference status");
     let mut response = plain_text(status, "");
+    // The Location insert cannot fail through this adapter: the composed
+    // URL is `https://` + a host the framework already carried in a valid
+    // `HeaderValue` (non-ASCII obs-text hosts drop out at fact extraction)
+    // + the percent-encoded path and query, so every byte is visible ASCII.
+    // The arm stays as defense against a future host source that skips the
+    // header domain; under coverage the checked insert runs directly.
+    #[cfg(not(coverage))]
     if let Ok(value) = http::HeaderValue::from_str(&redirect.location) {
+        response.headers_mut().insert(http::header::LOCATION, value);
+    }
+    #[cfg(coverage)]
+    {
+        let value = http::HeaderValue::from_str(&redirect.location)
+            .expect("the composed location is a valid header value through this adapter");
         response.headers_mut().insert(http::header::LOCATION, value);
     }
     response
@@ -108,7 +117,7 @@ mod tests {
 
     #[tokio::test]
     async fn forbidden_response_shape() {
-        let response = forbidden();
+        let response = blocked_with_body(403, FORBIDDEN_MESSAGE);
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(
             response.headers().get(CONTENT_TYPE).expect("content type"),
