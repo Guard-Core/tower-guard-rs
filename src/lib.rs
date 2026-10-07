@@ -523,8 +523,7 @@ impl GuardLayer {
         self
     }
 
-    /// Build the layer from the unified
-    /// [`SecurityConfig`](guard_core_engine::security_config::SecurityConfig)
+    /// Build the layer from the unified `SecurityConfig`
     /// (the reference configuration surface): every field the layer
     /// consumes maps onto the wired stage or knob it owns, in one place,
     /// with the reference semantics.
