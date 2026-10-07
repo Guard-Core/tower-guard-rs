@@ -195,11 +195,16 @@ pub use guard_core_engine::ip_ban::{
 pub use guard_core_engine::ip_gate::{
     IpGateConfig, IpGateDecision, IpGateDenial, IpGateError, IpGateVerdict,
 };
+pub use guard_core_engine::payload::{OnErrorFn, ResponseModifierFn};
 pub use guard_core_engine::rate_limit::{
     RateLimitConfig, RateLimitConfigError, RateLimitDecision, RateLimitEntry, RateLimitTier,
     RateLimiter, RouteRateLimits, TierDecision,
 };
+pub use guard_core_engine::security_config::{
+    BufferOverflowPolicy, LogFormat, LogLevel, SecurityConfig, SecurityConfigError,
+};
 pub use guard_core_engine::security_headers::SecurityHeadersConfig;
+pub use guard_core_engine::user_agent::UserAgentFilter;
 pub use guard_core_rs::cloud_provider::{CloudDecision, CloudProviderStage};
 pub use guard_core_rs::custom_checks::CustomChecksStage;
 pub use guard_core_rs::emergency_mode::{EmergencyAnswer, EmergencyModeStage};
@@ -221,6 +226,78 @@ pub use guard_core_rs::user_agent::{UserAgentConfigError, UserAgentStage, UserAg
 use std::net::IpAddr;
 use std::sync::Arc;
 use tower::Layer;
+
+/// Why [`GuardLayer::from_security_config`] refused a value: the engine
+/// constructor that rejected it, fail-closed.
+#[derive(Debug)]
+pub enum GuardConfigError {
+    /// An IP/CIDR list entry the gate cannot parse.
+    IpGate(IpGateError),
+    /// A zero rate-limit knob.
+    RateLimit(RateLimitConfigError),
+    /// A blocked user-agent pattern the `ReDoS` validator rejected.
+    UserAgent(UserAgentConfigError),
+    /// An invalid auto-ban knob group.
+    Ban(IpBanConfigError),
+}
+
+impl std::fmt::Display for GuardConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IpGate(error) => write!(f, "ip list: {error}"),
+            Self::RateLimit(error) => write!(f, "rate limit: {error}"),
+            Self::UserAgent(error) => write!(f, "blocked user agent: {error}"),
+            Self::Ban(error) => write!(f, "ip ban: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for GuardConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IpGate(error) => Some(error),
+            Self::RateLimit(error) => Some(error),
+            Self::UserAgent(error) => Some(error),
+            Self::Ban(error) => Some(error),
+        }
+    }
+}
+
+impl From<IpGateError> for GuardConfigError {
+    fn from(error: IpGateError) -> Self {
+        Self::IpGate(error)
+    }
+}
+
+impl From<RateLimitConfigError> for GuardConfigError {
+    fn from(error: RateLimitConfigError) -> Self {
+        Self::RateLimit(error)
+    }
+}
+
+impl From<UserAgentConfigError> for GuardConfigError {
+    fn from(error: UserAgentConfigError) -> Self {
+        Self::UserAgent(error)
+    }
+}
+
+impl From<IpBanConfigError> for GuardConfigError {
+    fn from(error: IpBanConfigError) -> Self {
+        Self::Ban(error)
+    }
+}
+
+/// The engine log level mapped onto the logging facade's enum (the
+/// reference literals are the same strings).
+fn map_log_level(level: LogLevel) -> guard_core_rs::logging::LogLevel {
+    match level {
+        LogLevel::Info => guard_core_rs::logging::LogLevel::Info,
+        LogLevel::Debug => guard_core_rs::logging::LogLevel::Debug,
+        LogLevel::Warning => guard_core_rs::logging::LogLevel::Warning,
+        LogLevel::Error => guard_core_rs::logging::LogLevel::Error,
+        LogLevel::Critical => guard_core_rs::logging::LogLevel::Critical,
+    }
+}
 
 /// The client IP the IP gate evaluates, carried in request extensions.
 ///
@@ -374,6 +451,9 @@ pub struct GuardLayer {
     /// The response-side pass (behavioral return rules + security headers
     /// + CORS) applied to every response the guard touches.
     response_processor: Option<Arc<ResponseProcessor>>,
+    /// The reference `exclude_paths`: request paths that bypass the whole
+    /// pipeline (the docs/static carve-out).
+    exclude_paths: Vec<String>,
     /// The scan entry point (test-only panic injection).
     scan_fn: ScanFn,
     /// The stage built by [`GuardLayer::layer`](tower::Layer::layer) from
@@ -417,6 +497,7 @@ impl GuardLayer {
             cloud_provider: None,
             user_agent: None,
             response_processor: None,
+            exclude_paths: Vec::new(),
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
             stage: None,
         }
@@ -426,6 +507,205 @@ impl GuardLayer {
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(default_config())
+    }
+
+    /// The request paths that bypass the whole pipeline (the reference
+    /// `exclude_paths` carve-out, exact path match).
+    #[must_use]
+    pub fn exclude_paths(&self) -> &[String] {
+        &self.exclude_paths
+    }
+
+    /// Set the `exclude_paths` carve-out.
+    #[must_use]
+    pub fn with_exclude_paths(mut self, paths: Vec<String>) -> Self {
+        self.exclude_paths = paths;
+        self
+    }
+
+    /// Build the layer from the unified `SecurityConfig`
+    /// (the reference configuration surface): every field the layer
+    /// consumes maps onto the wired stage or knob it owns, in one place,
+    /// with the reference semantics.
+    ///
+    /// The stages that need a host-provided collaborator (the geo handler,
+    /// the distributed stores, the event bus, the custom checks, the
+    /// time-window and referrer resolvers) stay opt-in through their own
+    /// builders: the config carries no such object.
+    ///
+    /// # Errors
+    ///
+    /// [`GuardConfigError`] when an engine constructor rejects a value
+    /// (an invalid IP/CIDR list entry, a zero rate-limit knob, or a
+    /// ReDoS-unsafe blocked user-agent pattern).
+    #[allow(clippy::too_many_lines)]
+    pub fn from_security_config(
+        config: &guard_core_engine::security_config::SecurityConfig,
+    ) -> Result<Self, GuardConfigError> {
+        let mut layer = Self::new(DetectConfig {
+            max_content_length: config.detection_max_content_length,
+            max_full_scan_bytes: config.detection_max_body_inspect_bytes,
+            preserve_attack_patterns: config.detection_preserve_attack_patterns,
+            semantic_threshold: config.detection_semantic_threshold,
+            threat_score_threshold: config.detection_threat_score_threshold,
+            binary_min_run_length: config.detection_binary_min_run_length,
+        })
+        .with_passive_mode(config.passive_mode)
+        .with_exclude_paths(config.exclude_paths.clone());
+
+        if config.whitelist.is_some()
+            || !config.blacklist.is_empty()
+            || !config.exempt_ips.is_empty()
+        {
+            layer = layer.with_ip_gate(guard_core_engine::ip_gate::IpGateConfig::new(
+                config.whitelist.clone().unwrap_or_default(),
+                config.blacklist.iter().cloned(),
+                config.exempt_ips.iter().cloned(),
+            )?);
+        }
+
+        if config.enable_rate_limiting {
+            let limiter = RateLimiter::new(RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: config.rate_limit,
+                rate_limit_window: config.rate_limit_window,
+                ..RateLimitConfig::default()
+            })?;
+            layer = layer.with_rate_limiting(limiter);
+        }
+
+        if config.enable_ip_banning {
+            layer = layer.with_ip_banning(IpBanManager::new(), config.ip_ban_config());
+        }
+
+        // Check 3: the global HTTPS arm; `X-Forwarded-Proto` trust rides
+        // the same knobs the reference reads them from.
+        layer = layer.with_https_enforcement(
+            HttpsEnforcementStage::builder(
+                guard_core_rs::https_enforcement::HttpsEnforcementStageConfig {
+                    enforce_https: config.enforce_https,
+                    trust_x_forwarded_proto: config.trust_x_forwarded_proto,
+                    passive_mode: config.passive_mode,
+                },
+            )
+            .build()?,
+        );
+
+        if config.emergency_mode || !config.emergency_whitelist.is_empty() {
+            layer = layer.with_emergency_mode(
+                EmergencyModeStage::builder(
+                    guard_core_rs::emergency_mode::EmergencyModeStageConfig {
+                        emergency_mode: config.emergency_mode,
+                        passive_mode: config.passive_mode,
+                    },
+                )
+                .emergency_whitelist(config.emergency_whitelist.iter().cloned())
+                .build()?,
+            );
+        }
+
+        if !config.custom_error_responses.is_empty() {
+            layer = layer.with_custom_error_responses(
+                config
+                    .custom_error_responses
+                    .iter()
+                    .map(|(status, body)| (*status, body.clone()))
+                    .collect(),
+            );
+        }
+
+        if let Some(hook) = config.on_block.clone() {
+            layer = layer.with_on_block(hook);
+        }
+
+        if !config.excluded_detection_headers.is_empty()
+            || !config.excluded_detection_params.is_empty()
+            || !config.excluded_detection_body_fields.is_empty()
+            || !config.enabled_detection_categories.is_empty()
+        {
+            layer = layer.with_detection_exclusions(DetectionExclusionConfig {
+                excluded_detection_headers: config
+                    .excluded_detection_headers
+                    .iter()
+                    .cloned()
+                    .collect(),
+                excluded_detection_params: config
+                    .excluded_detection_params
+                    .iter()
+                    .cloned()
+                    .collect(),
+                excluded_detection_body_fields: config
+                    .excluded_detection_body_fields
+                    .iter()
+                    .cloned()
+                    .collect(),
+                enabled_detection_categories: (!config.enabled_detection_categories.is_empty())
+                    .then(|| {
+                        config
+                            .enabled_detection_categories
+                            .iter()
+                            .cloned()
+                            .collect()
+                    }),
+                detection_scan_body: Some(config.detection_scan_body),
+            });
+        }
+
+        if let Some(level) = config.log_suspicious_level {
+            layer = layer.with_observability(ObservabilityConfig {
+                log_suspicious_level: Some(map_log_level(level)),
+                muted_check_logs: Some(config.muted_check_logs.iter().cloned().collect()),
+                sensitive: guard_core_rs::redact::SensitiveNames::new(
+                    Some(&config.log_sensitive_headers.iter().cloned().collect()),
+                    Some(&config.log_sensitive_params.iter().cloned().collect()),
+                    Some(&config.log_sensitive_body_fields.iter().cloned().collect()),
+                ),
+            });
+        }
+
+        if !config.blocked_user_agents.is_empty() {
+            layer = layer.with_user_agent(
+                UserAgentStage::builder(guard_core_rs::user_agent::UserAgentStageConfig {
+                    // The error arm takes its own line: the coverage
+                    // mapping attributes the `?` return to the function
+                    // exit, so an inline `?` here renders count 0 forever.
+                    blocked_user_agents: UserAgentFilter::new(
+                        config.blocked_user_agents.iter().cloned(),
+                    )
+                    .map_err(GuardConfigError::from)?,
+                    ip_ban: config.ip_ban_config(),
+                    passive_mode: config.passive_mode,
+                })
+                .build()?,
+            );
+        }
+
+        let wants_headers = config.security_headers.enabled;
+        if wants_headers || config.enable_cors || !config.global_behavior_rules.is_empty() {
+            let cors = config
+                .enable_cors
+                .then(|| guard_core_engine::cors::CorsConfig {
+                    enabled: true,
+                    allow_origins: config.cors_allow_origins.clone(),
+                    allow_methods: config.cors_allow_methods.clone(),
+                    allow_headers: config.cors_allow_headers.clone(),
+                    allow_credentials: config.cors_allow_credentials,
+                });
+            layer = layer.with_response_processor(ResponseProcessor::new(
+                wants_headers.then_some(config.security_headers.clone()),
+                cors,
+                config.global_behavior_rules.clone(),
+                Arc::new(std::sync::Mutex::new(
+                    guard_core_engine::behavior::BehaviorTracker::new(),
+                )),
+                IpBanManager::new(),
+                config.behavior_scan_response_body,
+                config.behavior_max_response_body_inspect_bytes,
+                config.passive_mode,
+            ));
+        }
+
+        Ok(layer)
     }
 
     /// Replace the body buffering cap, in bytes.
@@ -1036,6 +1316,109 @@ impl core::fmt::Debug for GuardLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guard_config_error_display_and_source_cover_every_variant() {
+        let ip_gate: GuardConfigError = IpGateError {
+            list: "whitelist",
+            entry: String::from("nope"),
+        }
+        .into();
+        assert!(ip_gate.to_string().contains("ip list"));
+        assert!(std::error::Error::source(&ip_gate).is_some());
+
+        let rate_limit: GuardConfigError = RateLimitConfigError {
+            field: std::borrow::Cow::Borrowed("rate_limit"),
+            reason: "must be at least 1",
+        }
+        .into();
+        assert!(rate_limit.to_string().contains("rate limit"));
+        assert!(std::error::Error::source(&rate_limit).is_some());
+
+        let user_agent: GuardConfigError = UserAgentConfigError {
+            entry: String::from("bad-bot"),
+            reason: String::from("rejected"),
+        }
+        .into();
+        assert!(user_agent.to_string().contains("blocked user agent"));
+        assert!(std::error::Error::source(&user_agent).is_some());
+
+        let ban: GuardConfigError = IpBanConfigError::NonPositive {
+            field: "auto_ban_threshold",
+        }
+        .into();
+        assert!(ban.to_string().contains("ip ban"));
+        assert!(std::error::Error::source(&ban).is_some());
+    }
+
+    #[test]
+    fn map_log_level_covers_every_reference_level() {
+        assert!(matches!(
+            map_log_level(LogLevel::Info),
+            guard_core_rs::logging::LogLevel::Info
+        ));
+        assert!(matches!(
+            map_log_level(LogLevel::Debug),
+            guard_core_rs::logging::LogLevel::Debug
+        ));
+        assert!(matches!(
+            map_log_level(LogLevel::Warning),
+            guard_core_rs::logging::LogLevel::Warning
+        ));
+        assert!(matches!(
+            map_log_level(LogLevel::Error),
+            guard_core_rs::logging::LogLevel::Error
+        ));
+        assert!(matches!(
+            map_log_level(LogLevel::Critical),
+            guard_core_rs::logging::LogLevel::Critical
+        ));
+    }
+
+    #[test]
+    fn from_security_config_observability_carries_the_level_and_redaction() {
+        let mut sensitive = std::collections::BTreeSet::new();
+        sensitive.insert(String::from("x-custom-secret"));
+        let config = SecurityConfig {
+            log_suspicious_level: Some(LogLevel::Error),
+            muted_check_logs: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("custom_request"));
+                set
+            },
+            log_sensitive_headers: sensitive,
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        let observability = layer.observability().expect("observability wired");
+        assert!(matches!(
+            observability.log_suspicious_level,
+            Some(guard_core_rs::logging::LogLevel::Error)
+        ));
+        let muted = observability.muted_check_logs.as_ref().expect("muted set");
+        assert!(muted.contains("custom_request"));
+        assert!(observability.sensitive.headers.contains("x-custom-secret"));
+    }
+
+    #[test]
+    fn from_security_config_exclude_paths_round_trip_through_the_accessor() {
+        let config = SecurityConfig {
+            exclude_paths: vec![String::from("/docs")],
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        assert_eq!(layer.exclude_paths(), ["/docs"]);
+    }
+
+    #[test]
+    fn from_security_config_user_agent_stage_is_wired() {
+        let config = SecurityConfig {
+            blocked_user_agents: vec![String::from("bad-bot")],
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        assert!(layer.user_agent().is_some());
+    }
 
     #[test]
     fn default_config_matches_corpus_knobs() {
