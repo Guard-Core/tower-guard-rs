@@ -119,6 +119,20 @@ async fn traversal_payload_in_path_is_blocked() {
     assert_eq!(body_text(response).await, BLOCKED_MESSAGE);
 }
 
+// The query decoder mirrors `urllib.parse.unquote_plus`: a traversal
+// payload hidden behind percent-encoding decodes before the engine sees it.
+#[tokio::test]
+async fn percent_encoded_traversal_in_query_is_decoded_and_blocked() {
+    let service = GuardLayer::new(default_config()).layer(echo());
+    let response = service
+        .oneshot(get("/search?q=%2E%2E%2F%2E%2F%2Fetc%2Fpasswd"))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_text(response).await, BLOCKED_MESSAGE);
+}
+
 #[tokio::test]
 async fn command_injection_in_query_is_blocked() {
     let service = GuardLayer::new(default_config()).layer(echo());
@@ -274,10 +288,21 @@ async fn inner_service_errors_are_propagated_not_swallowed() {
         },
     )));
     let error = service
+        .clone()
         .oneshot(get("/health"))
         .await
         .expect_err("inner error must propagate");
     assert_eq!(error.to_string(), "upstream down");
+
+    // A threat through the same instantiation: the block path answers
+    // before the inner service is ever polled, so both arms of the fused
+    // pipeline run inside this service's own monomorphization.
+    let response = service
+        .clone()
+        .oneshot(get("/files/../../etc/passwd"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1688,4 +1713,21 @@ async fn https_enforcement_host_forms_feed_the_trusted_proxy_comparison() {
             .expect("location"),
         "https://[2001:db8::1]:8443/private"
     );
+}
+
+// The block paths lift the request pieces from the request parts, so the
+// Origin header extraction on that path (the response processor's CORS
+// evaluation input) needs a blocked request that actually carries one.
+#[tokio::test]
+async fn origin_header_is_lifted_on_the_block_path() {
+    let service = GuardLayer::new(default_config()).layer(echo());
+    let request = Request::builder()
+        .uri("/files/../../etc/passwd")
+        .header(http::header::ORIGIN, "https://app.example")
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = service.oneshot(request).await.expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_text(response).await, BLOCKED_MESSAGE);
 }

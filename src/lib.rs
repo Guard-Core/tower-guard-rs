@@ -1134,5 +1134,17 @@ mod layer_gap_twins {
             .await
             .expect("infallible");
         assert_eq!(response.status(), StatusCode::OK);
+
+        // A threat through the same instantiation: the block path runs
+        // inside this service's own monomorphization as well, so both arms
+        // of the fused pipeline execute for the lazy-built stage.
+        let threat = Request::builder()
+            .uri("/files/../../etc/passwd")
+            .body(Full::new(Bytes::from_static(b"ping")))
+            .expect("request");
+        let response = tower::Service::call(&mut service, threat)
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

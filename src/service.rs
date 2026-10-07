@@ -7,7 +7,7 @@ use crate::response;
 use crate::stages::{RequestFacts, header_pairs};
 use bytes::{Bytes, BytesMut};
 use guard_core_engine::detection_exclusions::{
-    RequestSurfaces, RouteDetectionExclusions, resolve as resolve_exclusions,
+    RequestScanVerdict, RequestSurfaces, RouteDetectionExclusions, resolve as resolve_exclusions,
 };
 use guard_core_engine::ip_gate::IpGateDecision;
 use guard_core_engine::ip_gate::IpGateVerdict;
@@ -252,13 +252,7 @@ where
             let stage = layer
                 .stage()
                 .expect("the stage is built by GuardLayer::layer");
-            let finding = verdict
-                .as_ref()
-                .map(|verdict| guard_core_rs::tower::ThreatFinding {
-                    is_threat: true,
-                    categories: verdict.categories.clone(),
-                    trigger_info: verdict.reason.clone(),
-                });
+            let finding = threat_finding(verdict.as_ref());
             let observation = request_observation(&parts);
             if let Some(blocked) = stage.decide_bans_observed(facts.ip, Some(&observation)) {
                 return Ok(finish_generated(&parts, &layer, response::stage(&blocked)));
@@ -428,6 +422,21 @@ impl ProcessorInput {
                 .map(ToOwned::to_owned),
         }
     }
+}
+
+/// The detection feed the user-agent stage consumes: a flat finding lifted
+/// from the scan verdict, built outside the generic `call` body so the
+/// never-threatened test instantiations of that body (the failing-body,
+/// trailered-body, and plain-service-fn inners) do not carry the closure
+/// lines as uncovered regions of their own.
+fn threat_finding(
+    verdict: Option<&RequestScanVerdict>,
+) -> Option<guard_core_rs::tower::ThreatFinding> {
+    verdict.map(|verdict| guard_core_rs::tower::ThreatFinding {
+        is_threat: true,
+        categories: verdict.categories.clone(),
+        trigger_info: verdict.reason.clone(),
+    })
 }
 
 /// Run the response-side pass when a processor is installed: the global
@@ -1170,8 +1179,18 @@ mod tests {
             .uri("/hello")
             .body(Full::new(Bytes::new()))
             .expect("request");
-        let response = service.oneshot(request).await.expect("response");
+        let response = service.clone().oneshot(request).await.expect("response");
         assert_eq!(response.status(), 200);
+
+        // A threat through the same instantiation: the empty body skips the
+        // body view, the path verdict still answers inside this service's
+        // own monomorphization, and both arms of the fused pipeline run.
+        let threat = Request::builder()
+            .uri("/files/../../etc/passwd")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = service.oneshot(threat).await.expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -2325,8 +2344,19 @@ mod tests {
             .extension(gate_ip("192.0.2.85"))
             .body(Full::new(Bytes::new()))
             .expect("request");
-        let response = service.oneshot(request).await.expect("response");
+        let response = service.clone().oneshot(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+
+        // A threat through the same instantiation: the block path runs
+        // inside this service's own monomorphization as well.
+        let threat = Request::builder()
+            .uri("/files/../../etc/passwd")
+            .extension(gate_ip("192.0.2.85"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = service.oneshot(threat).await.expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_text(response).await, BLOCKED_MESSAGE);
     }
 
     #[tokio::test]
@@ -2435,12 +2465,24 @@ mod tests {
             .uri("/submit")
             .body(body)
             .expect("request");
-        let response = service.oneshot(request).await.expect("response");
+        let response = service.clone().oneshot(request).await.expect("response");
         assert_eq!(
             response.status(),
             StatusCode::OK,
             "benign data, benign trailers"
         );
+
+        // A threat through the same instantiation: the buffered-scan verdict
+        // answers inside this service's own monomorphization too, so both
+        // arms of the fused pipeline run for the trailered body type.
+        let threat = Request::builder()
+            .method(http::Method::POST)
+            .uri("/files/../../etc/passwd")
+            .body(TraileredBody::new(b"hello"))
+            .expect("request");
+        let response = service.clone().oneshot(threat).await.expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_text(response).await, BLOCKED_MESSAGE);
     }
 
     #[tokio::test]
