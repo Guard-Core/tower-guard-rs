@@ -35,11 +35,15 @@ http-body-util = "0.1"
 tower = { version = "0.5", default-features = false }
 
 [dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [lints.rust]
 unsafe_code = "forbid"
+# cargo-llvm-cov sets cfg(coverage) during coverage builds; declare it so the
+# cfg(not(coverage)) pairs in the sources stay lint-clean.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 
 [lints.clippy]
 all                     = { level = "deny", priority = -1 }

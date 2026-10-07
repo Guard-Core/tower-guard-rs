@@ -39,6 +39,19 @@ pub(crate) fn failure() -> Response<Full<Bytes>> {
     plain_text(StatusCode::INTERNAL_SERVER_ERROR, FAILURE_MESSAGE)
 }
 
+/// The HTTPS-enforcement redirect: the reference status with the
+/// scheme-upgraded `Location` target and an empty body.
+pub(crate) fn redirect(
+    redirect: &guard_core_rs::https_enforcement::HttpsRedirectAnswer,
+) -> Response<Full<Bytes>> {
+    let status = StatusCode::from_u16(redirect.status).expect("reference status");
+    let mut response = plain_text(status, "");
+    if let Ok(value) = http::HeaderValue::from_str(&redirect.location) {
+        response.headers_mut().insert(http::header::LOCATION, value);
+    }
+    response
+}
+
 /// The engine stage's block answer rendered in the family shape: the
 /// custom-error body override wins over the reference default message, and
 /// the throttled shape carries `Retry-After: <window seconds>`.

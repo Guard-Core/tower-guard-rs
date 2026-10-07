@@ -101,6 +101,15 @@ The Cargo.toml pins `guard-core-engine` and `guard-core-rs` at 4.2.0 and carries
 
 The adapter now depends on both halves of the sibling checkout: the `guard-core-engine` crate (detection, rate limiting, bans, exclusions, geo, distributed traits) and the `guard-core-rs` facade (the event bus, the log/redaction port, the `on_block`/custom-error contract, and the rate-limit stage the layer delegates to), both pinned at 4.2.0 with path fallbacks into `../guard-core-rs`.
 
+## Stage surface (the reference 17-check pipeline, wired)
+
+Every reference check the engine ships is installable on `GuardLayer`, and `GuardService` runs the installed set in the reference pipeline order (`provided_layers` hands the same stages back as standalone tower layers in that order): emergency mode, HTTPS enforcement, request logging, request size/content caps, required headers + authentication, referrer, custom validators, time windows, geo country blocking, cloud-provider blocking, user-agent filtering, bans, rate limiting, the custom-request check, and the response-side pass (behavioral return rules + security headers + CORS). The builder table lives in the crate docs.
+
+## Not wired on purpose
+
+- **WebSocket guard**: a tower service sees a WebSocket upgrade as an ordinary request, so the handshake is screened like any request; frames after the upgrade are not intercepted. There is no per-frame guard surface.
+- **Status route**: no `add_status_route` equivalent ships (a gap tracked family-wide); expose engine state through your own route if you need it.
+
 ## Development
 
 - MSRV: 1.92 (matches guard-core-rs); edition 2024

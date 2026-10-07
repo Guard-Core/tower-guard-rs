@@ -1147,6 +1147,7 @@ name = "tower-guard-rs"
 version = "1.4.0"
 dependencies = [
  "bytes",
+ "chrono",
  "guard-core-engine",
  "guard-core-rs",
  "http",
