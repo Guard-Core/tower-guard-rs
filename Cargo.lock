@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "guard-core-engine"
-version = "4.3.0"
+version = "4.3.1"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "guard-core-rs"
-version = "4.3.0"
+version = "4.3.1"
 dependencies = [
  "chrono",
  "guard-core-engine",
@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "tower-guard-rs"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "bytes",
  "guard-core-engine",
