@@ -680,7 +680,10 @@ async fn custom_validators_block_with_the_validator_response() {
                     Arc::new(
                         |ctx: &guard_core_engine::custom_checks::CustomRequestContext<'_>| {
                             (ctx.method != "POST").then_some(ValidatorAnswer::Response(
-                                CustomResponse { status: Some(403) },
+                                CustomResponse {
+                                    status: Some(403),
+                                    body: None,
+                                },
                             ))
                         },
                     ) as guard_core_engine::custom_checks::CustomValidatorFn,
@@ -843,7 +846,12 @@ async fn custom_request_blocks_with_the_function_response() {
     let stage = CustomChecksStage::builder()
         .custom_request(
             "maintenance_gate",
-            Arc::new(|ctx| (ctx.path == "/admin").then_some(CustomResponse { status: Some(503) })),
+            Arc::new(|ctx| {
+                (ctx.path == "/admin").then_some(CustomResponse {
+                    status: Some(503),
+                    body: None,
+                })
+            }),
         )
         .build();
     let service = GuardLayer::new(default_config())
@@ -1208,7 +1216,10 @@ fn validators_layer() -> GuardStageLayer {
                         Arc::new(
                             |ctx: &guard_core_engine::custom_checks::CustomRequestContext<'_>| {
                                 (ctx.method != "POST").then_some(ValidatorAnswer::Response(
-                                    CustomResponse { status: Some(403) },
+                                    CustomResponse {
+                                        status: Some(403),
+                                        body: None,
+                                    },
                                 ))
                             },
                         )
@@ -1325,7 +1336,10 @@ fn custom_request_layer() -> GuardStageLayer {
             .custom_request(
                 "maintenance_gate",
                 Arc::new(|ctx| {
-                    (ctx.path == "/admin").then_some(CustomResponse { status: Some(503) })
+                    (ctx.path == "/admin").then_some(CustomResponse {
+                        status: Some(503),
+                        body: None,
+                    })
                 }),
             )
             .build(),

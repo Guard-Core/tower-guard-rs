@@ -269,10 +269,13 @@ impl Decides for CustomChecksStage {
         // The validators half (the reference's ninth check); the
         // `custom_request` half runs at the seventeenth position and is a
         // separate layer ([`GuardStageLayer::CustomRequest`]).
+        // The standalone layer sees no buffered body (`None`): the fused
+        // GuardService passes its buffer at the same position.
         self.decide_custom_validators(
             &facts.path,
             &facts.method,
             facts.ip.is_some().then_some(facts.ip_string.as_str()),
+            None,
         )
         .map(StageVerdict::Validator)
     }
@@ -342,6 +345,7 @@ impl Decides for CustomRequestPosition {
                 &facts.method,
                 &facts.path,
                 facts.ip.is_some().then_some(facts.ip_string.as_str()),
+                None,
             )
             .map(StageVerdict::CustomRequest)
     }
