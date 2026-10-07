@@ -109,6 +109,7 @@
 //! | 12a / 15 / 16 bans / `rate_limit` / detection feed | [`GuardLayer::with_rate_limiting`] + [`GuardLayer::with_ip_banning`] |
 //! | 17 `custom_request` | [`GuardLayer::with_custom_checks`] |
 //! | response pass (return rules + security headers + CORS) | [`GuardLayer::with_response_processor`] |
+//! | per-route carrier (`bypassed_checks`, `require_https`, per-route UA/size limits, the rate and detection views) | [`GuardLayer::with_route_configs`] |
 //!
 //! These bodies follow the ecosystem's plain-text convention (the bare
 //! message, `text/plain; charset=utf-8`, same as the Python family) but
@@ -200,6 +201,7 @@ pub use guard_core_engine::rate_limit::{
     RateLimitConfig, RateLimitConfigError, RateLimitDecision, RateLimitEntry, RateLimitTier,
     RateLimiter, RouteRateLimits, TierDecision,
 };
+pub use guard_core_engine::route_config::{RouteConfig, RouteConfigResolver};
 pub use guard_core_engine::security_config::{
     BufferOverflowPolicy, LogFormat, LogLevel, SecurityConfig, SecurityConfigError,
 };
@@ -409,6 +411,12 @@ pub struct GuardLayer {
     ban_state: Option<Arc<BanState>>,
     /// The per-route rate-limit tier resolver (`path -> Option<RouteRateLimits>`).
     route_tiers: Option<RouteRateResolver>,
+    /// The reference `RouteConfigResolver` (`(method, path) ->
+    /// Option<Arc<RouteConfig>>`): the per-route carrier the pipeline
+    /// consumes (bypassed checks, `require_https`, per-route UA and size
+    /// limits, the rate-limit and detection views). An
+    /// `Arc<RouteConfig>` request extension wins over the resolver.
+    route_configs: Option<RouteConfigResolver>,
     /// The geolocation seam the geo rate-limit tier resolves through.
     geo_handler: Option<Arc<dyn GeoIpHandler>>,
     /// The event bus the stage's security events dispatch through.
@@ -477,6 +485,7 @@ impl GuardLayer {
             rate_limiter: None,
             ban_state: None,
             route_tiers: None,
+            route_configs: None,
             geo_handler: None,
             events: None,
             observability: None,
@@ -879,6 +888,38 @@ impl GuardLayer {
     pub fn with_route_tiers(mut self, resolver: RouteRateResolver) -> Self {
         self.route_tiers = Some(resolver);
         self
+    }
+
+    /// Install the reference `RouteConfigResolver` (the
+    /// [`guard_core_engine::route_config::RouteConfig`] carrier):
+    /// `(method, path) -> Option<Arc<RouteConfig>>`. The resolved route's
+    /// knobs apply on top of the global config for that route only, the
+    /// reference `RouteConfigResolver` semantics:
+    ///
+    /// - `bypassed_checks` (and the `"all"` wildcard) skip the named
+    ///   reference checks for the route (see the pipeline table for the
+    ///   fused-stage mapping),
+    /// - `require_https` forces the reference `301` for the route,
+    /// - `max_request_size` replaces the body cap for the route,
+    /// - `blocked_user_agents` is evaluated additively before the global
+    ///   filter (the reference `check_user_agent_allowed` order),
+    /// - `rate_limit`/`rate_limit_window`/`geo_rate_limits` become the
+    ///   route's rate-limit tier,
+    /// - the five detection-exclusion knobs resolve through the engine's
+    ///   detection view for the route.
+    ///
+    /// An `Arc<RouteConfig>` request extension wins over the resolver
+    /// (the app attaches a route's config directly, the reference
+    /// `request.state.route_config` idiom).
+    #[must_use]
+    pub fn with_route_configs(mut self, resolver: RouteConfigResolver) -> Self {
+        self.route_configs = Some(resolver);
+        self
+    }
+
+    /// The installed route-config resolver, if any.
+    pub(crate) const fn route_configs(&self) -> Option<&RouteConfigResolver> {
+        self.route_configs.as_ref()
     }
 
     /// Install the geolocation seam the geo rate-limit tier resolves

@@ -11,6 +11,7 @@ use guard_core_engine::detection_exclusions::{
 };
 use guard_core_engine::ip_gate::IpGateDecision;
 use guard_core_engine::ip_gate::IpGateVerdict;
+use guard_core_engine::route_config::RouteConfig;
 use guard_core_rs::process_response::{RequestBits, ResponseBits};
 use guard_core_rs::responses::{build_block_payload, fire_block_hook, resolve_error_body};
 use guard_core_rs::tower::{RequestObservation, RouteRateLimits};
@@ -135,14 +136,41 @@ where
                 return forward(&layer, &facts, parts, None, inner).await;
             }
 
+            // The reference `RouteConfigResolver`: the carrier extension
+            // wins over the installed resolver (the app attaches the
+            // route's config directly, the reference
+            // `request.state.route_config` idiom).
+            let route_carrier: Option<std::sync::Arc<RouteConfig>> = parts
+                .extensions
+                .get::<std::sync::Arc<RouteConfig>>()
+                .cloned()
+                .or_else(|| {
+                    layer
+                        .route_configs()
+                        .and_then(|resolver| resolver(&facts.method, &facts.path))
+                });
+            let route = route_carrier.as_deref();
+            // The reference `RouteConfigResolver.should_bypass_check`: the
+            // named check, or the `"all"` wildcard.
+            let bypassed = |check: &str| {
+                route.is_some_and(|route| {
+                    route.bypassed_checks.contains("all") || route.bypassed_checks.contains(check)
+                })
+            };
+
             // The IP gate runs before anything else: a denied IP must not
             // cost a body buffer, and detection still scans whatever passes.
-            if let Some(denial) = enforce_ip_gate(&mut parts, &layer) {
+            // The reference `ip_security` bypass skips the gate (and the
+            // ban/geo arms below, the fused `ip_security` block).
+            if !bypassed("ip_security")
+                && let Some(denial) = enforce_ip_gate(&mut parts, &layer)
+            {
                 return Ok(finish_generated(&parts, &layer, denial));
             }
 
             // Check 2: emergency mode (503 outside the whitelist).
-            if let Some(stage) = layer.emergency_mode()
+            if !bypassed("emergency_mode")
+                && let Some(stage) = layer.emergency_mode()
                 && let Some(answer) = stage.decide(
                     facts.ip.is_some().then_some(facts.ip_string.as_str()),
                     &facts.ip_string,
@@ -155,15 +183,33 @@ where
             }
 
             // Check 3: HTTPS enforcement (301 to the scheme-upgraded URL).
-            if let Some(stage) = layer.https_enforcement() {
+            // The route's `require_https` rides the same stage (the
+            // carrier lane), so the trust knobs and the passive handling
+            // match the global arm.
+            if !bypassed("https_enforcement") {
                 let client_host = facts.host.as_deref().map(host_of_authority);
-                if let Some(redirect) = stage.decide(
-                    &facts.path,
-                    &facts.scheme,
-                    client_host,
-                    facts.x_forwarded_proto.as_deref(),
-                    &facts.https_url(),
-                ) {
+                let route_require_https = route.is_some_and(|route| route.require_https);
+                let answer = if let Some(stage) = layer.https_enforcement() {
+                    stage.decide_route(
+                        &facts.path,
+                        &facts.scheme,
+                        client_host,
+                        facts.x_forwarded_proto.as_deref(),
+                        &facts.https_url(),
+                        route_require_https.then_some(true),
+                    )
+                } else if route_require_https && facts.scheme != "https" && !layer.passive_mode {
+                    // No stage installed: the route arm still composes the
+                    // reference redirect (route wins over the absent
+                    // global arm).
+                    Some(guard_core_rs::https_enforcement::HttpsRedirectAnswer {
+                        status: 301,
+                        location: facts.https_url(),
+                    })
+                } else {
+                    None
+                };
+                if let Some(redirect) = answer {
                     return Ok(finish_generated(
                         &parts,
                         &layer,
@@ -174,7 +220,9 @@ where
 
             // Check 4: request logging (compose-only, never blocks; the
             // composed line is the host's to emit).
-            if let Some(stage) = layer.request_logging() {
+            if !bypassed("request_logging")
+                && let Some(stage) = layer.request_logging()
+            {
                 let _ = stage.compose(
                     facts.ip.is_some().then_some(facts.ip_string.as_str()),
                     Some(&facts.method),
@@ -184,8 +232,15 @@ where
             }
 
             // Check 5: the request body buffers under the size cap
-            // (413) - the reference `request_size_content` stage.
-            let buffered = match buffer_body(&mut body, layer.body_cap()).await {
+            // (413) - the reference `request_size_content` stage. The
+            // route's `max_request_size` replaces the global cap for the
+            // route (the reference reads the route limit instead); the
+            // adapter's own cap stays the ceiling when the route sets none.
+            let body_cap = route
+                .and_then(|route| route.max_request_size)
+                .and_then(|size| usize::try_from(size).ok())
+                .unwrap_or_else(|| layer.body_cap());
+            let buffered = match buffer_body(&mut body, body_cap).await {
                 Ok(buffered) => buffered,
                 Err(BufferFailure::TooLarge) => {
                     return Ok(oversize_response(&parts, &layer));
@@ -195,8 +250,12 @@ where
                 }
             };
 
-            // Checks 6 + 7: required headers, then authentication.
-            if let Some(stage) = layer.headers_auth() {
+            // Checks 6 + 7: required headers, then authentication (the
+            // fused stage answers for both; bypassing either reference
+            // check skips the whole stage).
+            if !(bypassed("required_headers") || bypassed("authentication"))
+                && let Some(stage) = layer.headers_auth()
+            {
                 let pairs = header_pairs(&parts.headers);
                 if let Some((_, answer)) = stage.decide(&facts.path, &pairs) {
                     return Ok(block_response(
@@ -209,7 +268,8 @@ where
             }
 
             // Check 8: the route referrer gate.
-            if let Some(stage) = layer.referrer_gate()
+            if !bypassed("referrer")
+                && let Some(stage) = layer.referrer_gate()
                 && let Some(answer) = stage.decide(
                     &facts.path,
                     facts.referer.as_deref(),
@@ -223,7 +283,8 @@ where
 
             // Check 9: the route custom validators (first blocking
             // response wins, the validator's own shape).
-            if let Some(stage) = layer.custom_checks()
+            if !bypassed("custom_validators")
+                && let Some(stage) = layer.custom_checks()
                 && let Some(failure) = stage.decide_custom_validators(
                     &facts.path,
                     &facts.method,
@@ -235,7 +296,8 @@ where
             }
 
             // Check 10: the route time-window gate.
-            if let Some(stage) = layer.time_window_gate()
+            if !bypassed("time_window")
+                && let Some(stage) = layer.time_window_gate()
                 && let Some(answer) =
                     stage.decide(&facts.path, &facts.ip_string, &facts.path, &facts.method)
             {
@@ -244,11 +306,17 @@ where
 
             // The detection scan itself never blocks: the verdict feeds
             // the pipeline stages that do (the reference's
-            // `suspicious_activity` position, via the stage).
-            let verdict = match scan_request(&parts, buffered.as_ref(), &layer) {
-                ScanOutcome::Clean => None,
-                ScanOutcome::Failed => return Ok(failure_response(&parts, &layer)),
-                ScanOutcome::Threat(verdict) => Some(verdict),
+            // `suspicious_activity` position, via the stage). The
+            // reference `suspicious_activity` bypass skips the scan (and
+            // with it the violation feed) for the route.
+            let verdict = if bypassed("suspicious_activity") {
+                None
+            } else {
+                match scan_request(&parts, buffered.as_ref(), &layer) {
+                    ScanOutcome::Clean => None,
+                    ScanOutcome::Failed => return Ok(failure_response(&parts, &layer)),
+                    ScanOutcome::Threat(verdict) => Some(verdict),
+                }
             };
 
             // One engine-stage pass, split at the reference pipeline's
@@ -261,11 +329,16 @@ where
                 .expect("the stage is built by GuardLayer::layer");
             let finding = threat_finding(verdict.as_ref());
             let observation = request_observation(&parts);
-            if let Some(blocked) = stage.decide_bans_observed(facts.ip, Some(&observation)) {
+            if !bypassed("ip_security")
+                && let Some(blocked) = stage.decide_bans_observed(facts.ip, Some(&observation))
+            {
                 return Ok(finish_generated(&parts, &layer, response::stage(&blocked)));
             }
 
-            if let Some(stage) = layer.geo_blocking()
+            // The reference runs the country arms inside `ip_security`:
+            // the same bypass skips the geo stage.
+            if !bypassed("ip_security")
+                && let Some(stage) = layer.geo_blocking()
                 && let Some(decision) = stage.decide(facts.ip, facts.gate)
             {
                 return Ok(block_response(
@@ -276,7 +349,8 @@ where
                 ));
             }
 
-            if let Some(stage) = layer.cloud_provider()
+            if !bypassed("cloud_provider")
+                && let Some(stage) = layer.cloud_provider()
                 && let Some(decision) = stage.decide(facts.ip, facts.gate)
             {
                 return Ok(block_response(
@@ -287,33 +361,79 @@ where
                 ));
             }
 
-            if let Some(stage) = layer.user_agent()
-                && let Some(answer) = stage.decide(
+            if !bypassed("user_agent") {
+                // The route's `blocked_user_agents` runs additively before
+                // the global filter (the reference
+                // `check_user_agent_allowed` order); whitelisted and
+                // exempt IPs skip exactly what the stage skips. A
+                // non-compilable route pattern fails secure.
+                let route_blocks = route
+                    .filter(|route| !route.blocked_user_agents.is_empty())
+                    .filter(|_| {
+                        !facts
+                            .gate
+                            .is_some_and(|gate| gate.is_whitelisted || gate.is_exempt)
+                    })
+                    .map(|route| {
+                        guard_core_engine::user_agent::UserAgentFilter::from_trusted_patterns(
+                            route.blocked_user_agents.iter().cloned(),
+                        )
+                    });
+                match route_blocks {
+                    Some(Ok(filter))
+                        if filter.is_blocked(facts.user_agent.as_deref().unwrap_or("")) =>
+                    {
+                        return Ok(block_response(
+                            &parts,
+                            &layer,
+                            403,
+                            "User-Agent not allowed",
+                        ));
+                    }
+                    Some(Err(_)) => return Ok(failure_response(&parts, &layer)),
+                    _ => {}
+                }
+                if let Some(stage) = layer.user_agent()
+                    && let Some(answer) = stage.decide(
+                        facts.ip,
+                        facts.gate,
+                        Some(&facts.path),
+                        facts.user_agent.as_deref(),
+                        finding.as_ref(),
+                    )
+                {
+                    return Ok(block_response(
+                        &parts,
+                        &layer,
+                        answer.status.as_u16(),
+                        stage_answer_body(&answer),
+                    ));
+                }
+            }
+
+            // The carrier's rate-limit view is the route's tier (the
+            // reference reads `route_config.rate_limit`/
+            // `rate_limit_window`/`geo_rate_limits`); an invalid tier
+            // fails secure, and the `rate_limit` bypass skips the pass.
+            let carrier_tiers = match route.map(RouteConfig::rate_limits) {
+                Some(Ok(tiers)) => tiers,
+                Some(Err(_)) => return Ok(failure_response(&parts, &layer)),
+                None => None,
+            };
+            let route_tiers = carrier_tiers
+                .as_ref()
+                .or_else(|| parts.extensions.get::<RouteRateLimits>());
+            let gate = parts.extensions.get::<IpGateDecision>().copied();
+            if !bypassed("rate_limit")
+                && let Some(blocked) = stage.decide_tiers_observed(
                     facts.ip,
-                    facts.gate,
                     Some(&facts.path),
-                    facts.user_agent.as_deref(),
+                    route_tiers,
+                    gate,
                     finding.as_ref(),
+                    Some(&observation),
                 )
             {
-                return Ok(block_response(
-                    &parts,
-                    &layer,
-                    answer.status.as_u16(),
-                    stage_answer_body(&answer),
-                ));
-            }
-
-            let route = parts.extensions.get::<RouteRateLimits>();
-            let gate = parts.extensions.get::<IpGateDecision>().copied();
-            if let Some(blocked) = stage.decide_tiers_observed(
-                facts.ip,
-                Some(&facts.path),
-                route,
-                gate,
-                finding.as_ref(),
-                Some(&observation),
-            ) {
                 return Ok(finish_generated(&parts, &layer, response::stage(&blocked)));
             }
             if let (Some(verdict), false) = (&verdict, stage.config().passive_mode) {
@@ -349,7 +469,8 @@ where
             // Check 17: the global `custom_request` function (its own
             // response shape; a response without a status renders the
             // framework default 200).
-            if let Some(stage) = layer.custom_checks()
+            if !bypassed("custom_request")
+                && let Some(stage) = layer.custom_checks()
                 && let Some(answer) = stage.decide_custom_request(
                     &facts.method,
                     &facts.path,
@@ -3192,5 +3313,368 @@ mod tests {
         let layer = GuardLayer::new(default_config()).with_custom_checks(stage);
         let (status, _) = status_and_body(&layer, request_at("/admin", "192.0.2.9")).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // --- the reference RouteConfig carrier consumption (GAP-R2) ---
+
+    use guard_core_engine::route_config::RouteConfig;
+
+    fn resolver_for(
+        paths: &[(&str, &str)],
+        config: RouteConfig,
+    ) -> guard_core_engine::route_config::RouteConfigResolver {
+        let owned: Vec<(String, String)> = paths
+            .iter()
+            .map(|(method, path)| ((*method).to_owned(), (*path).to_owned()))
+            .collect();
+        Arc::new(move |method, path| {
+            owned
+                .iter()
+                .any(|(route_method, route_path)| route_method == method && route_path == path)
+                .then(|| Arc::new(config.clone()))
+        })
+    }
+
+    #[tokio::test]
+    async fn route_bypass_skips_emergency_mode_for_its_path() {
+        let stage = guard_core_rs::emergency_mode::EmergencyModeStage::builder(
+            guard_core_rs::emergency_mode::EmergencyModeStageConfig::default(),
+        )
+        .emergency_mode(true)
+        .build()
+        .expect("valid stage");
+        let config = RouteConfig {
+            bypassed_checks: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("emergency_mode"));
+                set
+            },
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_emergency_mode(stage)
+            .with_route_configs(resolver_for(&[("GET", "/open")], config));
+        let (blocked, _) = status_and_body(&layer, request_at("/locked", "192.0.2.9")).await;
+        assert_eq!(blocked, StatusCode::SERVICE_UNAVAILABLE);
+        let (open, _) = status_and_body(&layer, request_at("/open", "192.0.2.9")).await;
+        assert_eq!(open, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_all_wildcard_bypass_skips_everything() {
+        let stage = guard_core_rs::emergency_mode::EmergencyModeStage::builder(
+            guard_core_rs::emergency_mode::EmergencyModeStageConfig::default(),
+        )
+        .emergency_mode(true)
+        .build()
+        .expect("valid stage");
+        let gate = guard_core_engine::ip_gate::IpGateConfig::new(
+            [] as [&str; 0],
+            ["192.0.2.9"],
+            [] as [&str; 0],
+        )
+        .expect("valid lists");
+        let config = RouteConfig {
+            bypassed_checks: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("all"));
+                set
+            },
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_emergency_mode(stage)
+            .with_ip_gate(gate)
+            .with_route_configs(resolver_for(&[("GET", "/open")], config));
+        // Blacklisted IP + emergency mode, both skipped on the bypassed
+        // route, both enforced next door.
+        let (open, _) = status_and_body(&layer, request_at("/open", "192.0.2.9")).await;
+        assert_eq!(open, StatusCode::OK);
+        let (blocked, _) = status_and_body(&layer, request_at("/open2", "192.0.2.9")).await;
+        assert_eq!(blocked, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn route_require_https_forces_the_redirect_with_the_global_arm_off() {
+        let config = RouteConfig {
+            require_https: true,
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/tls")], config));
+        let mut request = request_at("/tls", "192.0.2.9");
+        request
+            .headers_mut()
+            .insert("host", http::HeaderValue::from_static("guard.example"));
+        let (status, _) = status_and_body(&layer, request).await;
+        assert_eq!(status.as_u16(), 301);
+        // Plain HTTP on an unlisted path stays 200.
+        let (plain, _) = status_and_body(&layer, request_at("/other", "192.0.2.9")).await;
+        assert_eq!(plain, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn route_max_request_size_answers_413_for_its_route_only() {
+        let config = RouteConfig {
+            max_request_size: Some(4),
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("POST", "/upload")], config));
+        let mut big = request_at("/upload", "192.0.2.9");
+        *big.method_mut() = http::Method::POST;
+        *big.body_mut() = Full::new(Bytes::from_static(b"12345"));
+        let (rejected, _) = status_and_body(&layer, big).await;
+        assert_eq!(rejected, StatusCode::PAYLOAD_TOO_LARGE);
+        // The same body on an unlisted route forwards (the global cap).
+        let mut ok = request_at("/upload2", "192.0.2.9");
+        *ok.method_mut() = http::Method::POST;
+        *ok.body_mut() = Full::new(Bytes::from_static(b"12345"));
+        let (passed, _) = status_and_body(&layer, ok).await;
+        assert_eq!(passed, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn route_blocked_user_agents_run_additively_before_the_global_filter() {
+        let config = RouteConfig {
+            blocked_user_agents: vec![String::from("route-bot")],
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let mut request = request_at("/api", "192.0.2.9");
+        request.headers_mut().insert(
+            "user-agent",
+            http::HeaderValue::from_static("route-bot/2.0"),
+        );
+        let (blocked, body) = status_and_body(&layer, request).await;
+        assert_eq!(blocked, StatusCode::FORBIDDEN);
+        assert_eq!(body, "User-Agent not allowed");
+        // Another route, same UA: the route list does not travel.
+        let mut request = request_at("/api2", "192.0.2.9");
+        request.headers_mut().insert(
+            "user-agent",
+            http::HeaderValue::from_static("route-bot/2.0"),
+        );
+        let (passed, _) = status_and_body(&layer, request).await;
+        assert_eq!(passed, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_user_agent_bypass_skips_both_lists_for_the_route() {
+        let config = RouteConfig {
+            blocked_user_agents: vec![String::from("route-bot")],
+            bypassed_checks: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("user_agent"));
+                set
+            },
+            ..RouteConfig::default()
+        };
+        let stage = guard_core_rs::user_agent::UserAgentStage::builder(
+            guard_core_rs::user_agent::UserAgentStageConfig {
+                blocked_user_agents: guard_core_engine::user_agent::UserAgentFilter::new([
+                    "global-bot",
+                ])
+                .expect("valid patterns"),
+                ip_ban: guard_core_engine::ip_ban::IpBanConfig {
+                    enable_ip_banning: false,
+                    ..guard_core_engine::ip_ban::IpBanConfig::default()
+                },
+                passive_mode: false,
+            },
+        )
+        .build()
+        .expect("valid stage");
+        let layer = GuardLayer::new(default_config())
+            .with_user_agent(stage)
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        // Both the route list and the global list are skipped on the
+        // bypassed route.
+        let mut request = request_at("/api", "192.0.2.9");
+        request
+            .headers_mut()
+            .insert("user-agent", http::HeaderValue::from_static("route-bot"));
+        let (open, _) = status_and_body(&layer, request).await;
+        assert_eq!(open, StatusCode::OK);
+        // The global list still answers outside the route.
+        let mut request = request_at("/api2", "192.0.2.9");
+        request
+            .headers_mut()
+            .insert("user-agent", http::HeaderValue::from_static("global-bot"));
+        let (blocked, _) = status_and_body(&layer, request).await;
+        assert_eq!(blocked, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn the_route_rate_view_becomes_the_tier() {
+        let config = RouteConfig {
+            rate_limit: Some(1),
+            rate_limit_window: Some(60),
+            ..RouteConfig::default()
+        };
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enable_rate_limiting: true,
+            rate_limit: 1000,
+            rate_limit_window: 60,
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let layer = GuardLayer::new(default_config())
+            .with_rate_limiting(limiter)
+            .with_route_configs(resolver_for(&[("GET", "/login")], config));
+        let (first, _) = status_and_body(&layer, request_at("/login", "192.0.2.9")).await;
+        assert_eq!(first, StatusCode::OK);
+        let (second, _) = status_and_body(&layer, request_at("/login", "192.0.2.9")).await;
+        assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
+        // The route tier does not travel: the global limiter is still at
+        // 1000 for the next path.
+        let (elsewhere, _) = status_and_body(&layer, request_at("/login2", "192.0.2.9")).await;
+        assert_eq!(elsewhere, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_rate_limit_bypass_skips_the_whole_pass_for_the_route() {
+        let config = RouteConfig {
+            bypassed_checks: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("rate_limit"));
+                set
+            },
+            ..RouteConfig::default()
+        };
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enable_rate_limiting: true,
+            rate_limit: 1,
+            rate_limit_window: 60,
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let layer = GuardLayer::new(default_config())
+            .with_rate_limiting(limiter)
+            .with_route_configs(resolver_for(&[("GET", "/free")], config));
+        for _ in 0..3 {
+            let (status, _) = status_and_body(&layer, request_at("/free", "192.0.2.9")).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (blocked, _) = status_and_body(&layer, request_at("/other", "192.0.2.9")).await;
+        assert_eq!(blocked, StatusCode::OK); // first hit outside is fine
+        let (throttled, _) = status_and_body(&layer, request_at("/other", "192.0.2.9")).await;
+        assert_eq!(throttled, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn the_suspicious_activity_bypass_skips_the_scan_for_the_route() {
+        let config = RouteConfig {
+            bypassed_checks: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("suspicious_activity"));
+                set
+            },
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/raw")], config));
+        // An sqli probe on the bypassed route forwards; the same probe
+        // next door is the 400.
+        let attack = Request::builder()
+            .uri("/raw?q=1%27+OR+1%3D1")
+            .extension(gate_ip("192.0.2.9"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (open, _) = status_and_body(&layer, attack).await;
+        assert_eq!(open, StatusCode::OK);
+        let blocked = Request::builder()
+            .uri("/other?q=1%27+OR+1%3D1")
+            .extension(gate_ip("192.0.2.9"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (blocked_status, _) = status_and_body(&layer, blocked).await;
+        assert_eq!(blocked_status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_non_compilable_route_pattern_fails_secure() {
+        let config = RouteConfig {
+            blocked_user_agents: vec![String::from("([")],
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let (status, body) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, FAILURE_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn the_carrier_extension_wins_over_the_resolver() {
+        let resolver_config = RouteConfig {
+            rate_limit: Some(1),
+            rate_limit_window: Some(60),
+            ..RouteConfig::default()
+        };
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enable_rate_limiting: true,
+            rate_limit: 1000,
+            rate_limit_window: 60,
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let layer = GuardLayer::new(default_config())
+            .with_rate_limiting(limiter)
+            .with_route_configs(resolver_for(&[("GET", "/login")], resolver_config));
+        // The extension carries a different route config (no tier): the
+        // resolver's 1-request tier never applies.
+        let mut request = request_at("/login", "192.0.2.9");
+        request
+            .extensions_mut()
+            .insert(Arc::new(RouteConfig::default()));
+        let (first, _) = status_and_body(&layer, request).await;
+        assert_eq!(first, StatusCode::OK);
+        let (second, _) = status_and_body(&layer, request_at("/login", "192.0.2.9")).await;
+        assert_eq!(second, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_carrier_tier_fails_secure() {
+        let config = RouteConfig {
+            rate_limit: Some(0),
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/bad")], config));
+        let (status, _) = status_and_body(&layer, request_at("/bad", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn the_resolver_sees_the_method_dimension() {
+        let config = RouteConfig {
+            bypassed_checks: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("suspicious_activity"));
+                set
+            },
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("POST", "/submit")], config));
+        // The POST view is bypassed; the GET view of the same path is not
+        // (the sqli probe answers the 400 there).
+        let post = Request::builder()
+            .method(http::Method::POST)
+            .uri("/submit?q=1%27+OR+1%3D1")
+            .extension(gate_ip("192.0.2.9"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (open, _) = status_and_body(&layer, post).await;
+        assert_eq!(open, StatusCode::OK);
+        let get = Request::builder()
+            .uri("/submit?q=1%27+OR+1%3D1")
+            .extension(gate_ip("192.0.2.9"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (blocked, _) = status_and_body(&layer, get).await;
+        assert_eq!(blocked, StatusCode::BAD_REQUEST);
     }
 }
