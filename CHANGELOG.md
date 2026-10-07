@@ -2,6 +2,20 @@
 
 All notable changes to this project.
 
+## [1.4.0] - 2026-10-07
+
+### Note
+
+- Trains with the engine: the `guard-core-engine` and `guard-core-rs` floors move to 4.3.1 (the parity-completion release)
+
+### Added
+
+- The reference status route (fastapi-guard `add_status_route` + `HandlerInitializer.get_initialization_status`): `GuardStatus` wired into the crate root, a tower `Service` serving the cloud-provider readiness table and the geo-ip component at `/_guard/status` from the handles the app already holds (#36). The WebSocket upgrade guard has no surface here: hyper-level upgrades live outside the tower `Service` contract
+
+### Changed
+
+- CI chores: the first-interaction greeting action takes its inputs underscore_named (#34) and is pinned to the v3.1.0 sha the engine repo pins (#33)
+
 ## [Unreleased]
 
 ## [1.3.0] - 2026-10-01
