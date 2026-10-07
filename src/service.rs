@@ -162,15 +162,19 @@ where
             // cost a body buffer, and detection still scans whatever passes.
             // The reference `ip_security` bypass skips the gate (and the
             // ban/geo arms below, the fused `ip_security` block).
-            if !bypassed("ip_security")
+            // The reference consults `should_bypass_check("ip")` around
+            // the whole `ip_security` block: gate, route IP restrictions,
+            // and country arms.
+            if !bypassed("ip")
                 && let Some(denial) = enforce_ip_gate(&mut parts, &layer)
             {
                 return Ok(finish_generated(&parts, &layer, denial));
             }
 
-            // Check 2: emergency mode (503 outside the whitelist).
-            if !bypassed("emergency_mode")
-                && let Some(stage) = layer.emergency_mode()
+            // Check 2: emergency mode (503 outside the whitelist). The
+            // reference pipeline never consults the bypass set here: the
+            // global stage is not route-bypassable.
+            if let Some(stage) = layer.emergency_mode()
                 && let Some(answer) = stage.decide(
                     facts.ip.is_some().then_some(facts.ip_string.as_str()),
                     &facts.ip_string,
@@ -185,20 +189,33 @@ where
             // Check 3: HTTPS enforcement (301 to the scheme-upgraded URL).
             // The route's `require_https` rides the same stage (the
             // carrier lane), so the trust knobs and the passive handling
-            // match the global arm.
-            if !bypassed("https_enforcement") {
+            // match the global arm; with no carrier route the stage's own
+            // resolver seam stays authoritative.
+            {
                 let client_host = facts.host.as_deref().map(host_of_authority);
-                let route_require_https = route.is_some_and(|route| route.require_https);
                 let answer = if let Some(stage) = layer.https_enforcement() {
-                    stage.decide_route(
-                        &facts.path,
-                        &facts.scheme,
-                        client_host,
-                        facts.x_forwarded_proto.as_deref(),
-                        &facts.https_url(),
-                        route_require_https.then_some(true),
-                    )
-                } else if route_require_https && facts.scheme != "https" && !layer.passive_mode {
+                    if let Some(route) = route {
+                        stage.decide_route(
+                            &facts.path,
+                            &facts.scheme,
+                            client_host,
+                            facts.x_forwarded_proto.as_deref(),
+                            &facts.https_url(),
+                            Some(route.require_https),
+                        )
+                    } else {
+                        stage.decide(
+                            &facts.path,
+                            &facts.scheme,
+                            client_host,
+                            facts.x_forwarded_proto.as_deref(),
+                            &facts.https_url(),
+                        )
+                    }
+                } else if route.is_some_and(|route| route.require_https)
+                    && facts.scheme != "https"
+                    && !layer.passive_mode
+                {
                     // No stage installed: the route arm still composes the
                     // reference redirect (route wins over the absent
                     // global arm).
@@ -220,9 +237,7 @@ where
 
             // Check 4: request logging (compose-only, never blocks; the
             // composed line is the host's to emit).
-            if !bypassed("request_logging")
-                && let Some(stage) = layer.request_logging()
-            {
+            if let Some(stage) = layer.request_logging() {
                 let _ = stage.compose(
                     facts.ip.is_some().then_some(facts.ip_string.as_str()),
                     Some(&facts.method),
@@ -250,12 +265,8 @@ where
                 }
             };
 
-            // Checks 6 + 7: required headers, then authentication (the
-            // fused stage answers for both; bypassing either reference
-            // check skips the whole stage).
-            if !(bypassed("required_headers") || bypassed("authentication"))
-                && let Some(stage) = layer.headers_auth()
-            {
+            // Checks 6 + 7: required headers, then authentication.
+            if let Some(stage) = layer.headers_auth() {
                 let pairs = header_pairs(&parts.headers);
                 if let Some((_, answer)) = stage.decide(&facts.path, &pairs) {
                     return Ok(block_response(
@@ -268,8 +279,7 @@ where
             }
 
             // Check 8: the route referrer gate.
-            if !bypassed("referrer")
-                && let Some(stage) = layer.referrer_gate()
+            if let Some(stage) = layer.referrer_gate()
                 && let Some(answer) = stage.decide(
                     &facts.path,
                     facts.referer.as_deref(),
@@ -283,12 +293,14 @@ where
 
             // Check 9: the route custom validators (first blocking
             // response wins, the validator's own shape).
-            if !bypassed("custom_validators")
-                && let Some(stage) = layer.custom_checks()
+            if let Some(stage) = layer.custom_checks()
                 && let Some(failure) = stage.decide_custom_validators(
                     &facts.path,
                     &facts.method,
                     facts.ip.is_some().then_some(facts.ip_string.as_str()),
+                    buffered
+                        .as_deref()
+                        .and_then(|bytes| std::str::from_utf8(bytes).ok()),
                 )
             {
                 let status = failure.status.unwrap_or(200);
@@ -296,8 +308,7 @@ where
             }
 
             // Check 10: the route time-window gate.
-            if !bypassed("time_window")
-                && let Some(stage) = layer.time_window_gate()
+            if let Some(stage) = layer.time_window_gate()
                 && let Some(answer) =
                     stage.decide(&facts.path, &facts.ip_string, &facts.path, &facts.method)
             {
@@ -309,7 +320,7 @@ where
             // `suspicious_activity` position, via the stage). The
             // reference `suspicious_activity` bypass skips the scan (and
             // with it the violation feed) for the route.
-            let verdict = if bypassed("suspicious_activity") {
+            let verdict = if bypassed("penetration") {
                 None
             } else {
                 match scan_request(&parts, buffered.as_ref(), &layer) {
@@ -329,15 +340,15 @@ where
                 .expect("the stage is built by GuardLayer::layer");
             let finding = threat_finding(verdict.as_ref());
             let observation = request_observation(&parts);
-            if !bypassed("ip_security")
+            if !bypassed("ip_ban")
                 && let Some(blocked) = stage.decide_bans_observed(facts.ip, Some(&observation))
             {
                 return Ok(finish_generated(&parts, &layer, response::stage(&blocked)));
             }
 
-            // The reference runs the country arms inside `ip_security`:
-            // the same bypass skips the geo stage.
-            if !bypassed("ip_security")
+            // The reference runs the country arms inside the `ip`-gated
+            // block: the same bypass skips the geo stage.
+            if !bypassed("ip")
                 && let Some(stage) = layer.geo_blocking()
                 && let Some(decision) = stage.decide(facts.ip, facts.gate)
             {
@@ -349,7 +360,7 @@ where
                 ));
             }
 
-            if !bypassed("cloud_provider")
+            if !bypassed("clouds")
                 && let Some(stage) = layer.cloud_provider()
                 && let Some(decision) = stage.decide(facts.ip, facts.gate)
             {
@@ -361,7 +372,7 @@ where
                 ));
             }
 
-            if !bypassed("user_agent") {
+            {
                 // The route's `blocked_user_agents` runs additively before
                 // the global filter (the reference
                 // `check_user_agent_allowed` order); whitelisted and
@@ -469,12 +480,14 @@ where
             // Check 17: the global `custom_request` function (its own
             // response shape; a response without a status renders the
             // framework default 200).
-            if !bypassed("custom_request")
-                && let Some(stage) = layer.custom_checks()
+            if let Some(stage) = layer.custom_checks()
                 && let Some(answer) = stage.decide_custom_request(
                     &facts.method,
                     &facts.path,
                     facts.ip.is_some().then_some(facts.ip_string.as_str()),
+                    buffered
+                        .as_deref()
+                        .and_then(|bytes| std::str::from_utf8(bytes).ok()),
                 )
             {
                 let status = answer.status.unwrap_or(200);
@@ -3205,7 +3218,10 @@ mod tests {
                         std::sync::Arc::new(
                             |ctx: &guard_core_engine::custom_checks::CustomRequestContext<'_>| {
                                 (ctx.method != "POST").then_some(ValidatorAnswer::Response(
-                                    CustomResponse { status: Some(403) },
+                                    CustomResponse {
+                                        status: Some(403),
+                                        body: None,
+                                    },
                                 ))
                             },
                         )
@@ -3306,7 +3322,10 @@ mod tests {
             .custom_request(
                 "maintenance_gate",
                 std::sync::Arc::new(|ctx| {
-                    (ctx.path == "/admin").then_some(CustomResponse { status: Some(503) })
+                    (ctx.path == "/admin").then_some(CustomResponse {
+                        status: Some(503),
+                        body: None,
+                    })
                 }),
             )
             .build();
@@ -3336,38 +3355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_bypass_skips_emergency_mode_for_its_path() {
-        let stage = guard_core_rs::emergency_mode::EmergencyModeStage::builder(
-            guard_core_rs::emergency_mode::EmergencyModeStageConfig::default(),
-        )
-        .emergency_mode(true)
-        .build()
-        .expect("valid stage");
-        let config = RouteConfig {
-            bypassed_checks: {
-                let mut set = std::collections::BTreeSet::new();
-                set.insert(String::from("emergency_mode"));
-                set
-            },
-            ..RouteConfig::default()
-        };
-        let layer = GuardLayer::new(default_config())
-            .with_emergency_mode(stage)
-            .with_route_configs(resolver_for(&[("GET", "/open")], config));
-        let (blocked, _) = status_and_body(&layer, request_at("/locked", "192.0.2.9")).await;
-        assert_eq!(blocked, StatusCode::SERVICE_UNAVAILABLE);
-        let (open, _) = status_and_body(&layer, request_at("/open", "192.0.2.9")).await;
-        assert_eq!(open, StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn the_all_wildcard_bypass_skips_everything() {
-        let stage = guard_core_rs::emergency_mode::EmergencyModeStage::builder(
-            guard_core_rs::emergency_mode::EmergencyModeStageConfig::default(),
-        )
-        .emergency_mode(true)
-        .build()
-        .expect("valid stage");
+    async fn the_all_wildcard_bypass_skips_every_queried_check() {
         let gate = guard_core_engine::ip_gate::IpGateConfig::new(
             [] as [&str; 0],
             ["192.0.2.9"],
@@ -3383,13 +3371,13 @@ mod tests {
             ..RouteConfig::default()
         };
         let layer = GuardLayer::new(default_config())
-            .with_emergency_mode(stage)
             .with_ip_gate(gate)
             .with_route_configs(resolver_for(&[("GET", "/open")], config));
-        // Blacklisted IP + emergency mode, both skipped on the bypassed
-        // route, both enforced next door.
+        // The blacklisted IP forwards on the bypassed route (the "all"
+        // wildcard matches the gate's "ip" query).
         let (open, _) = status_and_body(&layer, request_at("/open", "192.0.2.9")).await;
         assert_eq!(open, StatusCode::OK);
+        // The same IP takes the gate denial next door.
         let (blocked, _) = status_and_body(&layer, request_at("/open2", "192.0.2.9")).await;
         assert_eq!(blocked, StatusCode::FORBIDDEN);
     }
@@ -3461,52 +3449,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_user_agent_bypass_skips_both_lists_for_the_route() {
-        let config = RouteConfig {
-            blocked_user_agents: vec![String::from("route-bot")],
-            bypassed_checks: {
-                let mut set = std::collections::BTreeSet::new();
-                set.insert(String::from("user_agent"));
-                set
-            },
-            ..RouteConfig::default()
-        };
-        let stage = guard_core_rs::user_agent::UserAgentStage::builder(
-            guard_core_rs::user_agent::UserAgentStageConfig {
-                blocked_user_agents: guard_core_engine::user_agent::UserAgentFilter::new([
-                    "global-bot",
-                ])
-                .expect("valid patterns"),
-                ip_ban: guard_core_engine::ip_ban::IpBanConfig {
-                    enable_ip_banning: false,
-                    ..guard_core_engine::ip_ban::IpBanConfig::default()
-                },
-                passive_mode: false,
-            },
-        )
-        .build()
-        .expect("valid stage");
-        let layer = GuardLayer::new(default_config())
-            .with_user_agent(stage)
-            .with_route_configs(resolver_for(&[("GET", "/api")], config));
-        // Both the route list and the global list are skipped on the
-        // bypassed route.
-        let mut request = request_at("/api", "192.0.2.9");
-        request
-            .headers_mut()
-            .insert("user-agent", http::HeaderValue::from_static("route-bot"));
-        let (open, _) = status_and_body(&layer, request).await;
-        assert_eq!(open, StatusCode::OK);
-        // The global list still answers outside the route.
-        let mut request = request_at("/api2", "192.0.2.9");
-        request
-            .headers_mut()
-            .insert("user-agent", http::HeaderValue::from_static("global-bot"));
-        let (blocked, _) = status_and_body(&layer, request).await;
-        assert_eq!(blocked, StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
     async fn the_route_rate_view_becomes_the_tier() {
         let config = RouteConfig {
             rate_limit: Some(1),
@@ -3564,11 +3506,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_suspicious_activity_bypass_skips_the_scan_for_the_route() {
+    async fn the_penetration_bypass_skips_the_scan_for_the_route() {
         let config = RouteConfig {
             bypassed_checks: {
                 let mut set = std::collections::BTreeSet::new();
-                set.insert(String::from("suspicious_activity"));
+                set.insert(String::from("penetration"));
                 set
             },
             ..RouteConfig::default()
@@ -3604,6 +3546,32 @@ mod tests {
         let (status, body) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body, FAILURE_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn route_require_https_rides_the_installed_stage_lane() {
+        let config = RouteConfig {
+            require_https: true,
+            ..RouteConfig::default()
+        };
+        let stage = guard_core_rs::https_enforcement::HttpsEnforcementStage::builder(
+            guard_core_rs::https_enforcement::HttpsEnforcementStageConfig::default(),
+        )
+        .build()
+        .expect("valid stage");
+        let layer = GuardLayer::new(default_config())
+            .with_https_enforcement(stage)
+            .with_route_configs(resolver_for(&[("GET", "/tls")], config));
+        let mut request = request_at("/tls", "192.0.2.9");
+        request
+            .headers_mut()
+            .insert("host", http::HeaderValue::from_static("guard.example"));
+        let (status, _) = status_and_body(&layer, request).await;
+        assert_eq!(status.as_u16(), 301);
+        // An unlisted path passes (the global arm is off and the stage's
+        // resolver seam is not installed).
+        let (plain, _) = status_and_body(&layer, request_at("/other", "192.0.2.9")).await;
+        assert_eq!(plain, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -3652,7 +3620,7 @@ mod tests {
         let config = RouteConfig {
             bypassed_checks: {
                 let mut set = std::collections::BTreeSet::new();
-                set.insert(String::from("suspicious_activity"));
+                set.insert(String::from("penetration"));
                 set
             },
             ..RouteConfig::default()
