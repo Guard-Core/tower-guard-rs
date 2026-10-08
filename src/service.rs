@@ -1,5 +1,6 @@
 //! The middleware service: body buffering, view scanning, dispatching.
 
+use crate::FORBIDDEN_MESSAGE;
 use crate::GuardClientIp;
 use crate::GuardLayer;
 use crate::body::{BoxError, GuardBody};
@@ -229,14 +230,83 @@ where
                 })
             };
 
+            // The reference `_check_route_ip_access` (inside the
+            // `ip_security` block, before the global lists): the route's
+            // `ip_whitelist` / `ip_blacklist` decide first - a configured
+            // whitelist takes over the route verdict (a match passes, a
+            // miss denies), then the blacklist denies. A configured
+            // whitelist also overrides the global IP lists for the request
+            // (`_route_overrides_ip_lists` / `skip_ip_lists`), so the
+            // global gate is skipped and the skip flags stay unset. An
+            // invalid list entry fails secure (the reference validates at
+            // decoration time; the carrier's invalid entry rides the
+            // family's fail-secure arm, like an invalid route tier).
+            let mut skip_global_ip_lists = false;
+            if !bypassed("ip")
+                && let Some(route) = route
+                && (route.ip_whitelist.is_some() || route.ip_blacklist.is_some())
+            {
+                match guard_core_engine::ip_gate::RouteIpGate::new(
+                    route.ip_whitelist.iter().flatten().map(String::as_str),
+                    route.ip_blacklist.iter().flatten().map(String::as_str),
+                ) {
+                    Ok(gate) => {
+                        let verdict = facts.ip.map_or(
+                            guard_core_engine::ip_gate::RouteIpVerdict::Unrestricted,
+                            |ip| gate.evaluate(ip),
+                        );
+                        if verdict == guard_core_engine::ip_gate::RouteIpVerdict::Denied {
+                            return Ok(block_response(&parts, &layer, 403, FORBIDDEN_MESSAGE));
+                        }
+                        skip_global_ip_lists = gate.whitelist_configured();
+                    }
+                    Err(_) => return Ok(failure_response(&parts, &layer)),
+                }
+            }
+
+            // The route's country rules (`blocked_countries` /
+            // `whitelist_countries`, the reference `check_country_access`
+            // inside `_check_route_ip_access`): a route whitelist that
+            // passes also skips the global geo stage for the request
+            // (`skip_countries`). An unresolvable country blocks only
+            // under a restrictive route whitelist, exactly the engine's
+            // `check_countries` reading.
+            let mut skip_global_countries = false;
+            if !bypassed("ip")
+                && let Some(route) = route
+                && (route.blocked_countries.is_some() || route.whitelist_countries.is_some())
+            {
+                let route_gate = guard_core_engine::geo::parse_country_lists(
+                    route
+                        .whitelist_countries
+                        .iter()
+                        .flatten()
+                        .map(String::as_str),
+                    route.blocked_countries.iter().flatten().map(String::as_str),
+                );
+                if let (Some(ip), Some(handler)) = (facts.ip, layer.geo_handler.as_ref()) {
+                    if let Some(_block) = guard_core_engine::geo::check_countries(
+                        ip,
+                        &route_gate,
+                        handler.as_ref(),
+                        false,
+                    ) {
+                        return Ok(block_response(&parts, &layer, 403, FORBIDDEN_MESSAGE));
+                    }
+                    skip_global_countries = !route_gate.whitelist_countries.is_empty();
+                }
+            }
+
             // The IP gate runs before anything else: a denied IP must not
             // cost a body buffer, and detection still scans whatever passes.
             // The reference `ip_security` bypass skips the gate (and the
             // ban/geo arms below, the fused `ip_security` block).
             // The reference consults `should_bypass_check("ip")` around
             // the whole `ip_security` block: gate, route IP restrictions,
-            // and country arms.
+            // and country arms. A configured route whitelist overrides the
+            // global lists for the request, so the gate is skipped.
             if !bypassed("ip")
+                && !skip_global_ip_lists
                 && let Some(denial) = enforce_ip_gate(&mut parts, &layer)
             {
                 return Ok(finish_generated(&parts, &layer, denial));
@@ -350,7 +420,50 @@ where
                 }
             };
 
-            // Checks 6 + 7: required headers, then authentication.
+            // Checks 6 + 7: required headers, then authentication. The
+            // carrier's header and authentication rules (`required_headers`,
+            // `auth_required`, `authorization_header_required`, and the
+            // api-key group) evaluate through the engine's decision core -
+            // the same `headers_auth::decide` the fused stage runs - before
+            // the stage's own seam (the route wins first; a route without
+            // rules leaves the stage's own resolver authoritative). The
+            // `required_headers` value `required` is the reference's
+            // presence-only marker, exactly the fused stage's sentinel.
+            if let Some(route) = route {
+                let rules = guard_core_engine::headers_auth::HeaderAuthRules {
+                    required_headers: route
+                        .required_headers
+                        .iter()
+                        .map(
+                            |(name, expected)| guard_core_engine::headers_auth::RequiredHeader {
+                                name: name.clone(),
+                                expected: expected.clone(),
+                            },
+                        )
+                        .collect(),
+                    auth_required: route.auth_required.clone(),
+                    api_key_required: route.api_key_required,
+                    api_key_header: route.api_key_header.clone(),
+                    authorization_header_required: route.authorization_header_required.clone(),
+                };
+                if rules.has_rules() {
+                    let verifiers = guard_core_engine::headers_auth::RouteVerifiers {
+                        auth: route.auth_verifier.clone(),
+                        api_key: route.api_key_verifier.clone(),
+                    };
+                    let pairs = header_pairs(&parts.headers);
+                    if let Some(block) =
+                        guard_core_engine::headers_auth::decide(&rules, &verifiers, |name| {
+                            pairs
+                                .iter()
+                                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                                .map(|(_, value)| (*value).to_owned())
+                        })
+                    {
+                        return Ok(block_response(&parts, &layer, block.status, &block.body));
+                    }
+                }
+            }
             if let Some(stage) = layer.headers_auth() {
                 let pairs = header_pairs(&parts.headers);
                 if let Some((_, answer)) = stage.decide(&facts.path, &pairs) {
@@ -363,7 +476,32 @@ where
                 }
             }
 
-            // Check 8: the route referrer gate.
+            // Check 8: the route referrer gate. The carrier's
+            // `require_referrer` list decides through the engine's referrer
+            // core before the stage's own seam (the route wins first).
+            if let Some(route) = route
+                && let Some(domains) = route.require_referrer.as_ref()
+            {
+                match guard_core_engine::referrer::decide(facts.referer.as_deref(), domains) {
+                    guard_core_engine::referrer::ReferrerVerdict::Allowed => {}
+                    guard_core_engine::referrer::ReferrerVerdict::Missing => {
+                        return Ok(block_response(
+                            &parts,
+                            &layer,
+                            guard_core_engine::referrer::REFERRER_MISSING_STATUS,
+                            guard_core_engine::referrer::REFERRER_MISSING_BODY,
+                        ));
+                    }
+                    guard_core_engine::referrer::ReferrerVerdict::Invalid { .. } => {
+                        return Ok(block_response(
+                            &parts,
+                            &layer,
+                            guard_core_engine::referrer::REFERRER_INVALID_STATUS,
+                            guard_core_engine::referrer::REFERRER_INVALID_BODY,
+                        ));
+                    }
+                }
+            }
             if let Some(stage) = layer.referrer_gate()
                 && let Some(answer) = stage.decide(
                     &facts.path,
@@ -377,7 +515,42 @@ where
             }
 
             // Check 9: the route custom validators (first blocking
-            // response wins, the validator's own shape).
+            // response wins, the validator's own shape). The carrier's
+            // `custom_validators` run through the engine's validator core
+            // before the stage's own seam; the carrier type is unnamed, so
+            // each lands under the reference's `"anonymous"` fallback.
+            if let Some(route) = route
+                && !route.custom_validators.is_empty()
+            {
+                let named: Vec<(String, guard_core_engine::custom_checks::CustomValidatorFn)> =
+                    route
+                        .custom_validators
+                        .iter()
+                        .cloned()
+                        .map(|validator| {
+                            (
+                                guard_core_engine::custom_checks::anonymous_name(),
+                                validator,
+                            )
+                        })
+                        .collect();
+                let ctx = guard_core_engine::custom_checks::CustomRequestContext {
+                    method: &facts.method,
+                    path: &facts.path,
+                    client_ip: facts.ip.is_some().then_some(facts.ip_string.as_str()),
+                    body: buffered
+                        .as_deref()
+                        .and_then(|bytes| std::str::from_utf8(bytes).ok()),
+                };
+                if let guard_core_engine::custom_checks::CustomValidatorsVerdict::Failed {
+                    block,
+                    ..
+                } = guard_core_engine::custom_checks::decide_custom_validators(&named, &ctx)
+                {
+                    let status = block.and_then(|response| response.status).unwrap_or(200);
+                    return Ok(block_response(&parts, &layer, status, ""));
+                }
+            }
             if let Some(stage) = layer.custom_checks()
                 && let Some(failure) = stage.decide_custom_validators(
                     &facts.path,
@@ -392,7 +565,32 @@ where
                 return Ok(block_response(&parts, &layer, status, ""));
             }
 
-            // Check 10: the route time-window gate.
+            // Check 10: the route time-window gate. The carrier's
+            // `time_restrictions` dict (`start`, `end`, `timezone`) decides
+            // through the engine's time-window core before the stage's own
+            // seam; missing bounds read fail-open (the reference's `except`
+            // arm).
+            if let Some(route) = route
+                && let Some(restrictions) = route.time_restrictions.as_ref()
+            {
+                let window = guard_core_engine::time_window::TimeWindow {
+                    start: restrictions.get("start").cloned(),
+                    end: restrictions.get("end").cloned(),
+                    timezone: restrictions.get("timezone").cloned(),
+                };
+                let current = guard_core_engine::time_window::hhmm_in_zone(
+                    chrono::Utc::now(),
+                    window.timezone.as_deref(),
+                );
+                if !guard_core_engine::time_window::is_within(&window, &current) {
+                    return Ok(block_response(
+                        &parts,
+                        &layer,
+                        guard_core_engine::time_window::TIME_WINDOW_BLOCK_STATUS,
+                        guard_core_engine::time_window::TIME_WINDOW_BLOCK_BODY,
+                    ));
+                }
+            }
             if let Some(stage) = layer.time_window_gate()
                 && let Some(answer) =
                     stage.decide(&facts.path, &facts.ip_string, &facts.path, &facts.method)
@@ -406,8 +604,15 @@ where
             // reference `suspicious_activity` bypass skips the scan (and
             // with it the violation feed) for the route, and the global
             // `enable_penetration_detection` toggle skips it everywhere
-            // (the request proceeds clean).
-            let verdict = if bypassed("penetration") || !layer.penetration_detection_enabled() {
+            // (the request proceeds clean). The route's
+            // `enable_suspicious_detection` toggle overrides the default
+            // for its route only (the reference decorator's detection
+            // toggle, the `detection_enabled` resolution).
+            let verdict = if bypassed("penetration")
+                || !guard_core_engine::detection_exclusions::detection_enabled(
+                    layer.penetration_detection_enabled(),
+                    route.map(|route| route.enable_suspicious_detection),
+                ) {
                 None
             } else {
                 match scan_request(&parts, buffered.as_ref(), &layer) {
@@ -434,8 +639,10 @@ where
             }
 
             // The reference runs the country arms inside the `ip`-gated
-            // block: the same bypass skips the geo stage.
+            // block: the same bypass skips the geo stage, and a passing
+            // route country whitelist skips it too (`skip_countries`).
             if !bypassed("ip")
+                && !skip_global_countries
                 && let Some(stage) = layer.geo_blocking()
                 && let Some(decision) = stage.decide(facts.ip, facts.gate)
             {
@@ -3654,6 +3861,11 @@ mod tests {
             .expect("request")
     }
 
+    /// The traversal probe attributed to a client IP (the gate extension).
+    fn attack_request_at(path: &str, ip: &str) -> Request<Full<Bytes>> {
+        request_at(&format!("{path}?cmd=$(whoami)"), ip)
+    }
+
     /// A hand-written resolver: every address resolves to `US`.
     struct UnitedStates;
 
@@ -4407,6 +4619,480 @@ mod tests {
             .with_route_configs(resolver_for(&[("GET", "/bad")], config));
         let (status, _) = status_and_body(&layer, request_at("/bad", "192.0.2.9")).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // --- the carrier's stage knobs (the reference RouteConfig reads at
+    // the per-stage seams), end to end through the public API ---
+
+    fn request_with_headers(
+        path: &str,
+        ip: &str,
+        headers: &[(&str, &str)],
+    ) -> Request<Full<Bytes>> {
+        let mut builder = Request::builder().uri(path).extension(gate_ip(ip));
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(Full::new(Bytes::new())).expect("request")
+    }
+
+    fn minutes_to_hhmm(minutes: i64) -> String {
+        let minutes = minutes.rem_euclid(24 * 60);
+        format!("{:02}:{:02}", minutes / 60, minutes % 60)
+    }
+
+    #[tokio::test]
+    async fn route_ip_whitelist_overrides_the_global_lists() {
+        // The global gate blacklists the address; the route's whitelist
+        // takes over for its route (the match passes, the global deny is
+        // skipped) and misses deny with the reference Forbidden shape.
+        let gate = IpGateConfig::new(NIL, ["203.0.113.7"], NIL).expect("valid lists");
+        let config = RouteConfig {
+            ip_whitelist: Some(vec![String::from("203.0.113.7")]),
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_ip_gate(gate)
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let (status, _) = status_and_body(&layer, request_at("/api", "203.0.113.7")).await;
+        assert_eq!(status, StatusCode::OK, "the route whitelist match passes");
+        let (status, body) = status_and_body(&layer, request_at("/api", "192.0.2.5")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the route whitelist miss denies"
+        );
+        assert_eq!(body, FORBIDDEN_MESSAGE);
+        // The whitelist overrides the global lists for its route only: the
+        // same address stays denied on the unlisted path (the global gate).
+        let (status, _) = status_and_body(&layer, request_at("/other", "203.0.113.7")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the global gate holds off-route"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_ip_blacklist_denies_its_route_only() {
+        let config = RouteConfig {
+            ip_blacklist: Some(vec![String::from("192.0.2.6")]),
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let (status, body) = status_and_body(&layer, request_at("/api", "192.0.2.6")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, FORBIDDEN_MESSAGE);
+        let (status, _) = status_and_body(&layer, request_at("/api", "192.0.2.5")).await;
+        assert_eq!(status, StatusCode::OK, "a non-listed address passes");
+        let (status, _) = status_and_body(&layer, request_at("/other", "192.0.2.6")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the blacklist holds on its route only"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_route_ip_list_entry_fails_secure() {
+        let config = RouteConfig {
+            ip_whitelist: Some(vec![String::from("not-an-ip")]),
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let (status, _) = status_and_body(&layer, request_at("/api", "192.0.2.5")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn route_country_rules_without_a_geo_handler_pass() {
+        // No geolocation seam: the route's country rules cannot resolve,
+        // the arm leaves the request alone (the unattributed-and-unresolvable
+        // reading), and the request passes.
+        let config = RouteConfig {
+            whitelist_countries: Some(vec![String::from("DE")]),
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let (status, _) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn route_validator_truthy_non_response_passes_through() {
+        // The truthy non-response never blocks: the family renders the
+        // status-less shape (the reference logs only), so the request
+        // proceeds.
+        let validator: guard_core_engine::custom_checks::CustomValidatorFn = Arc::new(|_ctx| {
+            Some(guard_core_engine::custom_checks::ValidatorAnswer::TruthyNonResponse)
+        });
+        let config = RouteConfig {
+            custom_validators: vec![validator],
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let (status, _) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn route_validator_passing_its_route_falls_through() {
+        // A validator that declines to answer on the matched route leaves
+        // the lane without a verdict: the request proceeds (the stage's
+        // own seam stays authoritative behind the carrier lane).
+        let validator: guard_core_engine::custom_checks::CustomValidatorFn = Arc::new(|_ctx| None);
+        let config = RouteConfig {
+            custom_validators: vec![validator],
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let (status, _) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn route_blocked_countries_block_their_route_only() {
+        let config = RouteConfig {
+            blocked_countries: Some(vec![String::from("DE")]),
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_geo_handler(Arc::new(StaticGeo))
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let (status, _) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "DE is route-blocked");
+        // The unlisted path never consults the route's country rules.
+        let (status, _) = status_and_body(&layer, request_at("/other", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::OK);
+        // The route passes for a country outside the block list.
+        let config_pass = RouteConfig {
+            blocked_countries: Some(vec![String::from("RU")]),
+            ..RouteConfig::default()
+        };
+        let layer_pass = GuardLayer::new(default_config())
+            .with_geo_handler(Arc::new(StaticGeo))
+            .with_route_configs(resolver_for(&[("GET", "/api")], config_pass));
+        let (status, _) = status_and_body(&layer_pass, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::OK, "DE is outside the route block list");
+    }
+
+    #[tokio::test]
+    async fn route_country_whitelist_skips_the_global_geo_stage() {
+        // The global geo stage blocks DE; the route's whitelist_countries
+        // = [DE] passes its route and skips the global stage
+        // (`skip_countries`), while the unlisted path takes the global 403.
+        let config = RouteConfig {
+            whitelist_countries: Some(vec![String::from("DE")]),
+            ..RouteConfig::default()
+        };
+        let global_geo =
+            guard_core_rs::geo::GeoStage::builder(guard_core_rs::geo::GeoStageConfig {
+                gate: guard_core_engine::geo::parse_country_lists(NIL, ["DE"]),
+                handler: Some(Arc::new(StaticGeo)),
+                passive_mode: false,
+            })
+            .build();
+        let layer = GuardLayer::new(default_config())
+            .with_geo_blocking(global_geo)
+            .with_geo_handler(Arc::new(StaticGeo))
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let (status, _) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::OK, "the route whitelist match passes");
+        let (status, _) = status_and_body(&layer, request_at("/other", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "the global geo stage holds");
+    }
+
+    #[tokio::test]
+    async fn route_required_headers_demand_their_headers() {
+        let config = RouteConfig {
+            required_headers: [
+                (String::from("X-Request-ID"), String::from("required")),
+                (String::from("X-Tenant"), String::from("acme")),
+            ]
+            .into_iter()
+            .collect(),
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        // The missing presence-only header.
+        let (status, body) =
+            status_and_body(&layer, request_with_headers("/api", "192.0.2.9", &[])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "Missing required header: X-Request-ID");
+        // The present sentinel, the missing exact value.
+        let (status, body) = status_and_body(
+            &layer,
+            request_with_headers("/api", "192.0.2.9", &[("x-request-id", "abc")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "Missing required header: X-Tenant");
+        // The mismatching exact value.
+        let (status, body) = status_and_body(
+            &layer,
+            request_with_headers(
+                "/api",
+                "192.0.2.9",
+                &[("x-request-id", "abc"), ("x-tenant", "other")],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "Header 'X-Tenant' does not match the required value");
+        // The satisfying request passes, and the unlisted path never
+        // consults the route's rules.
+        let (status, _) = status_and_body(
+            &layer,
+            request_with_headers(
+                "/api",
+                "192.0.2.9",
+                &[("x-request-id", "abc"), ("x-tenant", "acme")],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) =
+            status_and_body(&layer, request_with_headers("/other", "192.0.2.9", &[])).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn route_auth_required_demands_the_scheme() {
+        let config = RouteConfig {
+            auth_required: Some(String::from("bearer")),
+            auth_verifier: Some(Arc::new(|credential: &str| credential == "token-1")),
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let (status, body) =
+            status_and_body(&layer, request_with_headers("/api", "192.0.2.9", &[])).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, "Authentication required");
+        let (status, _) = status_and_body(
+            &layer,
+            request_with_headers("/api", "192.0.2.9", &[("authorization", "Bearer token-1")]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the credential satisfies the scheme"
+        );
+        let (status, _) =
+            status_and_body(&layer, request_with_headers("/other", "192.0.2.9", &[])).await;
+        assert_eq!(status, StatusCode::OK, "the unlisted path is unguarded");
+    }
+
+    #[tokio::test]
+    async fn route_api_key_group_reads_its_header() {
+        let config = RouteConfig {
+            api_key_required: true,
+            api_key_header: Some(String::from("X-Key")),
+            api_key_verifier: Some(Arc::new(|credential: &str| credential == "secret")),
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let (status, body) =
+            status_and_body(&layer, request_with_headers("/api", "192.0.2.9", &[])).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, "Authentication required");
+        let (status, _) = status_and_body(
+            &layer,
+            request_with_headers("/api", "192.0.2.9", &[("x-key", "secret")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the verifier accepts the key");
+        // A rejected key answers the fixed 401 shape.
+        let (status, _) = status_and_body(
+            &layer,
+            request_with_headers("/api", "192.0.2.9", &[("x-key", "wrong")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "the verifier rejects");
+        let (status, _) =
+            status_and_body(&layer, request_with_headers("/other", "192.0.2.9", &[])).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn route_custom_validator_blocks_with_its_status() {
+        let validator: guard_core_engine::custom_checks::CustomValidatorFn = Arc::new(
+            |ctx: &guard_core_engine::custom_checks::CustomRequestContext<'_>| {
+                (ctx.path == "/api").then_some(
+                    guard_core_engine::custom_checks::ValidatorAnswer::Response(
+                        guard_core_engine::custom_checks::CustomResponse {
+                            status: Some(418),
+                            body: None,
+                        },
+                    ),
+                )
+            },
+        );
+        let config = RouteConfig {
+            custom_validators: vec![validator],
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let (status, _) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(
+            status,
+            StatusCode::IM_A_TEAPOT,
+            "the validator's status wins"
+        );
+        let (status, _) = status_and_body(&layer, request_at("/other", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::OK, "the validator holds on its route");
+    }
+
+    #[tokio::test]
+    async fn route_require_referrer_gates_its_route() {
+        let config = RouteConfig {
+            require_referrer: Some(vec![String::from("partner.example.com")]),
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let (status, body) =
+            status_and_body(&layer, request_with_headers("/api", "192.0.2.9", &[])).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "Referrer required");
+        let (status, body) = status_and_body(
+            &layer,
+            request_with_headers(
+                "/api",
+                "192.0.2.9",
+                &[("referer", "https://evil.example.net/x")],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "Invalid referrer");
+        let (status, _) = status_and_body(
+            &layer,
+            request_with_headers(
+                "/api",
+                "192.0.2.9",
+                &[("referer", "https://partner.example.com/x")],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) =
+            status_and_body(&layer, request_with_headers("/other", "192.0.2.9", &[])).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the unlisted path needs no referrer"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_time_restrictions_gate_their_route() {
+        // The window bounds are computed off the current wall clock so the
+        // twins stay deterministic: a plain span ending before `now`
+        // blocks, a span straddling `now` passes.
+        let now_minutes = {
+            use chrono::Timelike;
+            let now = chrono::Utc::now();
+            i64::from(now.hour() * 60 + now.minute())
+        };
+        // Both plain-span shapes exclude `now` by construction, so the
+        // twins stay deterministic whichever side of midnight the test
+        // runs on.
+        let (late_start, late_end) = (now_minutes + 5, now_minutes + 10);
+        let (early_start, early_end) = (now_minutes - 15, now_minutes - 10);
+        let blocked = RouteConfig {
+            time_restrictions: Some(
+                [
+                    (String::from("start"), minutes_to_hhmm(late_start)),
+                    (String::from("end"), minutes_to_hhmm(late_end)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], blocked));
+        let (status, body) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "now is outside the window");
+        assert_eq!(body, "Access not allowed at this time");
+        let (status, _) = status_and_body(&layer, request_at("/other", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::OK, "the window holds on its route");
+
+        // The early-span variant: the same decision, the bounds before now.
+        let early = RouteConfig {
+            time_restrictions: Some(
+                [
+                    (String::from("start"), minutes_to_hhmm(early_start)),
+                    (String::from("end"), minutes_to_hhmm(early_end)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], early));
+        let (status, _) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "now is outside the early span"
+        );
+
+        let passing = RouteConfig {
+            time_restrictions: Some(
+                [
+                    (String::from("start"), minutes_to_hhmm(now_minutes - 2)),
+                    (String::from("end"), minutes_to_hhmm(now_minutes + 2)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], passing));
+        let (status, _) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::OK, "now is inside the window");
+        // Missing bounds read fail-open (the reference's except arm).
+        let fail_open = RouteConfig {
+            time_restrictions: Some(
+                [(String::from("start"), String::from("09:00"))]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], fail_open));
+        let (status, _) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::OK, "a malformed dict reads fail-open");
+    }
+
+    #[tokio::test]
+    async fn route_enable_suspicious_detection_false_skips_the_scan() {
+        let config = RouteConfig {
+            enable_suspicious_detection: false,
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/open")], config));
+        // The scan toggle holds on its route: the traversal passes unscreened.
+        let (status, _) = status_and_body(&layer, attack_request_at("/open", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::OK);
+        // The unlisted path stays screened.
+        let (status, _) = status_and_body(&layer, attack_request_at("/other", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
