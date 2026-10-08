@@ -708,6 +708,8 @@ impl GuardLayer {
         if let Some(level) = config.log_suspicious_level {
             layer = layer.with_observability(ObservabilityConfig {
                 log_suspicious_level: Some(map_log_level(level)),
+                log_request_level: None,
+                log_country_check_level: None,
                 muted_check_logs: Some(config.muted_check_logs.iter().cloned().collect()),
                 sensitive: guard_core_rs::redact::SensitiveNames::new(
                     Some(&config.log_sensitive_headers.iter().cloned().collect()),
