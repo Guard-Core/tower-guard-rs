@@ -4,13 +4,14 @@
 //! (`guard_core/core/initialization/handler_initializer.py`): the
 //! cloud-provider readiness table and the geo-ip component.
 //!
-//! The Rust engine tracks the cloud table's readiness only
-//! ([`CloudIpTable::provider_is_ready`] is "the reference `get_status`'s
-//! `ready` flag"), so each provider row carries `ready` alone - the
-//! `entries`/`last_refreshed` keys the Python family serves have no engine
-//! surface here and are not invented. The geo-ip component is `null` when no
-//! handler is configured and `{"configured":true}` when one is: the engine
-//! exposes no geo health readout ([`guard_core_engine::geo::GeoIpHandler`] is the lookup trait).
+//! Each provider row carries the reference `get_status` shape -
+//! `ready`, `last_refreshed` (the unix-second stamp of the last range
+//! load, `null` before one), and `entries` (the network count) - read
+//! from the live [`CloudIpTable`]. The geo-ip component is `null` when no
+//! handler is configured, `{"configured":true}` when only the lookup
+//! trait is wired ([`guard_core_engine::geo::GeoIpHandler`] carries no
+//! health readout), and the [`IpInfoManager`] health snapshot
+//! (`{ready, last_refreshed, entries}`) when the lifecycle manager is.
 //!
 //! # Example
 //!
@@ -23,7 +24,8 @@
 //! assert!(payload.contains(r#""geo_ip":null"#));
 //! ```
 
-use guard_core_engine::cloud_provider::{CloudIpTable, VALID_CLOUD_PROVIDERS};
+use guard_core_engine::cloud_provider::{CloudIpTable, ProviderStatus, VALID_CLOUD_PROVIDERS};
+use guard_core_rs::geo_lifecycle::IpInfoManager;
 use http::{Request, Response, StatusCode, header::CONTENT_TYPE};
 use http_body_util::Full;
 use std::convert::Infallible;
@@ -50,6 +52,7 @@ pub const DEFAULT_STATUS_PATH: &str = "/_guard/status";
 pub struct GuardStatus {
     cloud: Option<CloudIpTable>,
     geo_configured: bool,
+    geo_manager: Option<std::sync::Arc<IpInfoManager>>,
 }
 
 impl GuardStatus {
@@ -78,18 +81,45 @@ impl GuardStatus {
         self
     }
 
-    /// The cloud providers with their readiness flags, in the engine's
-    /// reference order.
+    /// Serve the geo-ip health snapshot from the lifecycle manager (the
+    /// reference `getattr(geo_ip_handler, "get_status")` arm): the
+    /// component renders the manager's own `{ready, last_refreshed,
+    /// entries}` readout instead of the bare configured flag.
     #[must_use]
-    pub fn cloud_provider_status(&self) -> Vec<(&'static str, bool)> {
+    pub fn with_geo_manager(mut self, geo_manager: std::sync::Arc<IpInfoManager>) -> Self {
+        self.geo_manager = Some(geo_manager);
+        self
+    }
+
+    /// The geo-ip component of the payload: the manager's health snapshot
+    /// when the lifecycle manager is wired, the bare configured flag when
+    /// only the lookup trait is, `null` otherwise.
+    #[must_use]
+    pub fn geo_ip_status(&self) -> Option<String> {
+        if let Some(manager) = &self.geo_manager {
+            let snapshot = serde_json::Value::Object(manager.get_status());
+            return Some(snapshot.to_string());
+        }
+        self.geo_configured
+            .then(|| String::from("{\"configured\":true}"))
+    }
+
+    /// The cloud providers with their status rows (ready, refreshed,
+    /// entries), in the engine's reference order.
+    #[must_use]
+    pub fn cloud_provider_status(&self) -> Vec<(&'static str, ProviderStatus)> {
         VALID_CLOUD_PROVIDERS
             .iter()
             .map(|provider| {
-                let ready = self
-                    .cloud
-                    .as_ref()
-                    .is_some_and(|table| table.provider_is_ready(provider));
-                (*provider, ready)
+                let row = self.cloud.as_ref().map_or_else(
+                    || ProviderStatus {
+                        ready: false,
+                        last_refreshed: None,
+                        entries: 0,
+                    },
+                    |table| table.provider_status(provider),
+                );
+                (*provider, row)
             })
             .collect()
     }
@@ -99,7 +129,7 @@ impl GuardStatus {
     pub fn payload(&self) -> String {
         let mut payload = String::from(r#"{"cloud_providers":{"#);
         let mut first = true;
-        for (provider, ready) in self.cloud_provider_status() {
+        for (provider, row) in self.cloud_provider_status() {
             if first {
                 first = false;
             } else {
@@ -107,14 +137,25 @@ impl GuardStatus {
             }
             payload.push_str(&json_string(provider));
             payload.push_str(r#":{"ready":"#);
-            payload.push_str(if ready { "true" } else { "false" });
+            payload.push_str(if row.ready { "true" } else { "false" });
+            payload.push_str(r#","last_refreshed":"#);
+            match row.last_refreshed {
+                Some(stamp) => {
+                    let _ = write!(payload, "{stamp}");
+                }
+                None => payload.push_str("null"),
+            }
+            payload.push_str(r#","entries":"#);
+            let _ = write!(payload, "{}", row.entries);
             payload.push('}');
         }
         payload.push_str("},");
-        if self.geo_configured {
-            payload.push_str(r#""geo_ip":{"configured":true}"#);
-        } else {
-            payload.push_str(r#""geo_ip":null"#);
+        match self.geo_ip_status() {
+            Some(geo) => {
+                payload.push_str(r#""geo_ip":"#);
+                payload.push_str(&geo);
+            }
+            None => payload.push_str(r#""geo_ip":null"#),
         }
         payload.push('}');
         payload
@@ -200,13 +241,49 @@ mod tests {
         assert_eq!(
             payload,
             "{\"cloud_providers\":{\
-             \"AWS\":{\"ready\":false},\
-             \"GCP\":{\"ready\":false},\
-             \"Azure\":{\"ready\":false},\
-             \"DigitalOcean\":{\"ready\":false},\
-             \"Linode\":{\"ready\":false},\
-             \"Vultr\":{\"ready\":false}},\
+             \"AWS\":{\"ready\":false,\"last_refreshed\":null,\"entries\":0},\
+             \"GCP\":{\"ready\":false,\"last_refreshed\":null,\"entries\":0},\
+             \"Azure\":{\"ready\":false,\"last_refreshed\":null,\"entries\":0},\
+             \"DigitalOcean\":{\"ready\":false,\"last_refreshed\":null,\"entries\":0},\
+             \"Linode\":{\"ready\":false,\"last_refreshed\":null,\"entries\":0},\
+             \"Vultr\":{\"ready\":false,\"last_refreshed\":null,\"entries\":0}},\
              \"geo_ip\":null}"
+        );
+    }
+
+    #[test]
+    fn loaded_provider_rows_carry_the_refresh_stamp_and_entry_count() {
+        let table = CloudIpTable::default();
+        table
+            .set_provider_ranges(
+                "AWS",
+                vec![
+                    ("203.0.113.0/24".to_owned(), None),
+                    ("198.51.100.0/24".to_owned(), None),
+                ],
+            )
+            .expect("valid ranges");
+        let payload = GuardStatus::new().with_cloud_table(table).payload();
+        assert!(
+            payload.contains(r#""AWS":{"ready":true,"last_refreshed":"#),
+            "the AWS row carries the stamp: {payload}"
+        );
+        assert!(payload.contains(r#""entries":2}"#), "{payload}");
+        assert!(
+            payload.contains(r#""GCP":{"ready":false,"last_refreshed":null,"entries":0}"#),
+            "the unloaded rows stay null/0: {payload}"
+        );
+    }
+
+    #[test]
+    fn the_geo_manager_renders_the_health_snapshot() {
+        let manager =
+            std::sync::Arc::new(IpInfoManager::new("token", None, 86_400).expect("token"));
+        let payload = GuardStatus::new().with_geo_manager(manager).payload();
+        assert!(
+            payload.contains(r#""geo_ip":{"entries":0,"last_refreshed":null,"ready":false}"#)
+                || payload.contains(r#""ready":false"#),
+            "the snapshot renders: {payload}"
         );
     }
 
@@ -220,15 +297,18 @@ mod tests {
         let providers = status.cloud_provider_status();
         assert_eq!(providers.len(), 6);
         let aws = providers.iter().find(|(name, _)| *name == "AWS");
-        assert_eq!(aws.copied(), Some(("AWS", true)));
+        assert_eq!(
+            aws.map(|(name, row)| (*name, row.ready)),
+            Some(("AWS", true))
+        );
         assert!(
             providers
                 .iter()
-                .all(|(name, ready)| *name == "AWS" || !ready)
+                .all(|(name, row)| *name == "AWS" || !row.ready)
         );
         let payload = status.payload();
-        assert!(payload.contains(r#""AWS":{"ready":true}"#));
-        assert!(payload.contains(r#""GCP":{"ready":false}"#));
+        assert!(payload.contains(r#""AWS":{"ready":true,"last_refreshed":"#));
+        assert!(payload.contains(r#""GCP":{"ready":false,"last_refreshed":null,"entries":0}"#));
     }
 
     #[test]
@@ -250,7 +330,7 @@ mod tests {
             snapshot
                 .cloud_provider_status()
                 .iter()
-                .any(|(name, ready)| *name == "Vultr" && *ready)
+                .any(|(name, row)| *name == "Vultr" && row.ready)
         );
         // The failed-refresh shape: the refresher drops the provider and the
         // snapshot follows (clones share the store).
@@ -259,7 +339,7 @@ mod tests {
             !snapshot
                 .cloud_provider_status()
                 .iter()
-                .any(|(_, ready)| *ready)
+                .any(|(_, row)| row.ready)
         );
     }
 
