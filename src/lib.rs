@@ -428,6 +428,12 @@ pub struct GuardLayer {
     observability: Option<ObservabilityConfig>,
     /// The reference `on_block` callback, fired once per blocked request.
     on_block: Option<OnBlockHook>,
+    /// The reference `custom_response_modifier`: mutates every response
+    /// the response pass touches (forwarded and blocked alike) before it
+    /// leaves the pipeline.
+    response_modifier: Option<guard_core_engine::payload::ResponseModifierFn>,
+    /// The reference `on_error` best-effort hook.
+    on_error: Option<guard_core_rs::responses::OnErrorHook>,
     /// The status-to-body overrides for every block answer.
     custom_error_responses: CustomErrorResponses,
     /// The reference `passive_mode`: log-only, no block is ever rendered.
@@ -515,6 +521,8 @@ impl GuardLayer {
             observability: None,
             on_block: None,
             custom_error_responses: CustomErrorResponses::new(),
+            response_modifier: None,
+            on_error: None,
             passive_mode: false,
             distributed: None,
             distributed_ban_store: None,
@@ -1041,6 +1049,30 @@ impl GuardLayer {
     #[must_use]
     pub fn with_on_block(mut self, hook: OnBlockHook) -> Self {
         self.on_block = Some(hook);
+        self
+    }
+
+    /// Install the reference `custom_response_modifier`: the callback
+    /// runs LAST in the response pass (after the CORS verdict) over
+    /// every response the guard touches - forwarded and blocked alike.
+    /// A panicking callback leaves the response unmodified (the
+    /// reference's except arm) and reports through the `on_error` hook
+    /// when one is installed.
+    #[must_use]
+    pub fn with_custom_response_modifier(
+        mut self,
+        modifier: guard_core_engine::payload::ResponseModifierFn,
+    ) -> Self {
+        self.response_modifier = Some(modifier);
+        self
+    }
+
+    /// Install the reference `on_error` best-effort hook: invoked when a
+    /// middleware step fails, receiving `(stage, error, context)`. A
+    /// raising callback is caught and dropped, never propagated.
+    #[must_use]
+    pub fn with_on_error(mut self, hook: guard_core_rs::responses::OnErrorHook) -> Self {
+        self.on_error = Some(hook);
         self
     }
 
