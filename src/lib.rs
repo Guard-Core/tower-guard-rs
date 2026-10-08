@@ -348,6 +348,9 @@ pub const fn default_config() -> DetectConfig {
         semantic_threshold: 0.7,
         threat_score_threshold: 1.0,
         binary_min_run_length: 16,
+        max_scan_values: 512,
+        max_scan_chars: 65_536,
+        max_json_depth: 32,
     }
 }
 
@@ -575,6 +578,9 @@ impl GuardLayer {
             semantic_threshold: config.detection_semantic_threshold,
             threat_score_threshold: config.detection_threat_score_threshold,
             binary_min_run_length: config.detection_binary_min_run_length,
+            max_scan_values: config.detection_max_scan_values,
+            max_scan_chars: config.detection_max_scan_chars,
+            max_json_depth: config.detection_max_json_depth,
         })
         .with_passive_mode(config.passive_mode)
         .with_exclude_paths(config.exclude_paths.clone());

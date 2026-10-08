@@ -1154,6 +1154,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn from_security_config_feeds_the_scan_budgets() {
+        // The scan-budget knobs ride the unified config onto the scan
+        // path: a two-value budget stops the scan before the third
+        // value, so the threat in the last query param never surfaces.
+        let config = SecurityConfig {
+            detection_max_scan_values: 2,
+            ..SecurityConfig::default()
+        };
+        let attack = Request::builder()
+            .uri("/scan?a=benign-one&b=benign-two&c=1%20UNION%20SELECT%20password")
+            .header("x-forwarded-for", "203.0.113.9")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, _) = config_status_and_body(&config, attack).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "values past the scan-value budget are not scanned"
+        );
+
+        // The same request shape under the default budget scans (the
+        // below-threshold verdict blocks, the family 400 shape).
+        let attack_again = Request::builder()
+            .uri("/scan?a=benign-one&b=benign-two&c=1%20UNION%20SELECT%20password")
+            .header("x-forwarded-for", "203.0.113.9")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, _) = config_status_and_body(&SecurityConfig::default(), attack_again).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    #[tokio::test]
     async fn from_security_config_defaults_screen_clean_traffic() {
         let config = SecurityConfig::default();
         let (status, _) = config_status_and_body(&config, benign_request("203.0.113.9")).await;
