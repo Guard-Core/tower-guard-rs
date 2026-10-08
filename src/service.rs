@@ -157,6 +157,22 @@ where
                 return forward(&layer, &facts, parts, None, inner).await;
             }
 
+            // The reference's CORS preflight short-circuit: an OPTIONS
+            // request carrying `access-control-request-method` answers from
+            // the resolved CORS config directly (the reference
+            // `is_preflight` + `build_preflight_response` in
+            // `cors_handler.py`), before every security check. CORS
+            // disabled (or no response processor) leaves OPTIONS requests
+            // to the pipeline like any other method.
+            if facts.method.eq_ignore_ascii_case("OPTIONS")
+                && let Some(processor) = layer.response_processor()
+                && processor.cors_enabled()
+                && let Some(answer) =
+                    preflight_answer(processor.cors().expect("cors enabled"), &parts)
+            {
+                return Ok(answer);
+            }
+
             // The reference `RouteConfigResolver`: the carrier extension
             // wins over the installed resolver (the app attaches the
             // route's config directly, the reference
@@ -171,6 +187,39 @@ where
                         .and_then(|resolver| resolver(&facts.method, &facts.path))
                 });
             let route = route_carrier.as_deref();
+
+            // The reference `process_usage_rules`: the route's usage and
+            // frequency behavior rules track the request observation and a
+            // crossed threshold dispatches the rule's action (a `ban`
+            // lands in the shared ban manager and renders the banned
+            // shape). The behavioral processor runs before the check
+            // pipeline (the reference dispatches it from the middleware's
+            // request pass).
+            let route_rules: &[guard_core_engine::behavior::BehaviorRule] =
+                route.map_or(&[], |route| &route.behavior_rules);
+            if !route_rules.is_empty()
+                && let Some(processor) = layer.response_processor()
+            {
+                let endpoint_id = format!("{}:{}", facts.method, facts.path);
+                let actions = processor.process_usage_rules(
+                    &endpoint_id,
+                    &facts.ip.map_or_else(String::new, |ip| ip.to_string()),
+                    route_rules,
+                    std::time::SystemTime::now(),
+                );
+                if actions
+                    .iter()
+                    .any(guard_core_engine::behavior::BehaviorAction::is_ban)
+                {
+                    return Ok(block_response(
+                        &parts,
+                        &layer,
+                        403,
+                        crate::ACTIVITY_BANNED_MESSAGE,
+                    ));
+                }
+            }
+
             // The reference `RouteConfigResolver.should_bypass_check`: the
             // named check, or the `"all"` wildcard.
             let bypassed = |check: &str| {
@@ -668,6 +717,63 @@ fn finish_generated<B2>(
 
 /// A guard block answer: the family plain-text shape plus the
 /// response-side pass.
+/// The CORS preflight short-circuit answer (the reference `is_preflight`
+/// plus `build_preflight_response`).
+///
+/// `Some` when the request is a preflight (OPTIONS carrying the
+/// request-method header), rendered from the resolved CORS config alone:
+/// the reference answers the preflight before the pipeline and its
+/// response pass run.
+fn preflight_answer<B2>(
+    cors: &guard_core_engine::cors::CorsConfig,
+    parts: &Parts,
+) -> Option<Response<GuardBody<B2>>> {
+    let request_headers: Vec<(String, String)> = parts
+        .headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    if !guard_core_engine::cors::is_preflight(parts.method.as_str(), &request_headers) {
+        return None;
+    }
+    let answer = guard_core_engine::cors::build_preflight_response(
+        cors,
+        guard_core_engine::cors::PreflightRequest {
+            origin: request_headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("origin"))
+                .map(|(_, value)| value.as_str()),
+            request_method: request_headers
+                .iter()
+                .find(|(name, _)| {
+                    name.eq_ignore_ascii_case(
+                        guard_core_engine::cors::ALLOWED_PREFLIGHT_REQUEST_HEADER,
+                    )
+                })
+                .map(|(_, value)| value.as_str()),
+            request_headers_raw: request_headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("access-control-request-headers"))
+                .map(|(_, value)| value.as_str()),
+        },
+    );
+    let mut generated = response::blocked_with_body(answer.status_code, &answer.body);
+    for (name, value) in &answer.headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::try_from(name.as_str()),
+            HeaderValue::from_str(value),
+        ) {
+            generated.headers_mut().insert(name, value);
+        }
+    }
+    Some(generated.map(GuardBody::Generated))
+}
+
 fn block_response<B2>(
     parts: &Parts,
     layer: &GuardLayer,
@@ -3373,6 +3479,138 @@ mod tests {
                 .any(|(route_method, route_path)| route_method == method && route_path == path)
                 .then(|| Arc::new(config.clone()))
         })
+    }
+
+    #[tokio::test]
+    async fn the_cors_preflight_short_circuits_before_every_check() {
+        // The from_security_config-built layer (CORS on, the security
+        // headers on): an OPTIONS preflight answers from the CORS config.
+        let layer = GuardLayer::from_security_config(&SecurityConfig {
+            enable_cors: true,
+            cors_allow_origins: vec!["https://app.example.com".to_owned()],
+            cors_allow_methods: vec!["GET".to_owned(), "POST".to_owned()],
+            cors_allow_headers: vec!["content-type".to_owned()],
+            cors_max_age: 900,
+            ..SecurityConfig::default()
+        })
+        .expect("valid config");
+        let preflight = http::Request::builder()
+            .method("OPTIONS")
+            .uri("/api")
+            .header("Origin", "https://app.example.com")
+            .header("Access-Control-Request-Method", "POST")
+            .header("Access-Control-Request-Headers", "Content-Type")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = guarded(&layer).oneshot(preflight).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("Access-Control-Allow-Origin")
+                .map(|value| value.to_str().expect("ascii")),
+            Some("https://app.example.com")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("Access-Control-Max-Age")
+                .map(|value| value.to_str().expect("ascii")),
+            Some("900")
+        );
+
+        // A disallowed origin: 400 with the failure list.
+        let bad = http::Request::builder()
+            .method("OPTIONS")
+            .uri("/api")
+            .header("Origin", "https://evil.example.com")
+            .header("Access-Control-Request-Method", "DELETE")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = guarded(&layer).oneshot(bad).await.expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body();
+        let bytes = http_body_util::BodyExt::collect(body)
+            .await
+            .expect("body")
+            .to_bytes();
+        assert_eq!(bytes, "Disallowed CORS: origin, method");
+
+        // An OPTIONS without the request-method header is not a preflight:
+        // the gate skips and the pipeline runs (the upstream answers).
+        let response = guarded(&layer)
+            .oneshot(
+                http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api")
+                    .body(Full::new(Bytes::new()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // CORS disabled: the preflight runs the pipeline like any request
+        // (the upstream answers).
+        let plain = GuardLayer::new(default_config());
+        let response = guarded(&plain)
+            .oneshot(
+                http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api")
+                    .header("Access-Control-Request-Method", "POST")
+                    .body(Full::new(Bytes::new()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_route_usage_rules_track_and_ban_at_the_threshold() {
+        let config = RouteConfig {
+            behavior_rules: vec![guard_core_engine::behavior::BehaviorRule {
+                rule_type: String::from("usage"),
+                threshold: 2,
+                window: 60,
+                pattern: String::new(),
+                action: String::from("ban"),
+                ban_duration: Some(3600),
+                correlate_with_detection: false,
+            }],
+            ..RouteConfig::default()
+        };
+        let processor = guard_core_rs::process_response::ResponseProcessor::new(
+            None,
+            None,
+            Vec::new(),
+            Arc::new(Mutex::new(
+                guard_core_engine::behavior::BehaviorTracker::new(),
+            )),
+            IpBanManager::new(),
+            true,
+            262_144,
+            false,
+        );
+        let layer = GuardLayer::new(default_config())
+            .with_response_processor(processor)
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+
+        // Two observations: under the strict threshold, both forward.
+        let (first, _) = status_and_body(&layer, request_at("/api", "192.0.2.71")).await;
+        assert_eq!(first, StatusCode::OK);
+        let (second, _) = status_and_body(&layer, request_at("/api", "192.0.2.71")).await;
+        assert_eq!(second, StatusCode::OK);
+        // The third crossing bans (the reference apply_action ban), and
+        // the answer is the activity-banned shape.
+        let (third, body) = status_and_body(&layer, request_at("/api", "192.0.2.71")).await;
+        assert_eq!(third, StatusCode::FORBIDDEN);
+        assert_eq!(body, ACTIVITY_BANNED_MESSAGE);
+
+        // A different identity on the same route counts independently.
+        let (other, _) = status_and_body(&layer, request_at("/api", "192.0.2.72")).await;
+        assert_eq!(other, StatusCode::OK);
     }
 
     #[tokio::test]
