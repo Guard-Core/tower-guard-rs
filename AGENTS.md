@@ -3,9 +3,9 @@ Guidance for AI agents (including Claude Code) working in this repository.
 
 ## Project Overview
 
-tower-guard-rs is the framework-agnostic Rust adapter for the Guard ecosystem: a [`tower::Layer`](https://docs.rs/tower/latest/tower/trait.Layer.html) plus [`tower::Service`](https://docs.rs/tower/latest/tower/trait.Service.html) that screens `http::Request` traffic through the [guard-core-rs](https://github.com/rennf93/guard-core-rs) detection engine before forwarding it to the wrapped service. It contains no security logic of its own.
+tower-guard-rs is the framework-agnostic Rust adapter for the Guard ecosystem: a [`tower::Layer`](https://docs.rs/tower/latest/tower/trait.Layer.html) plus [`tower::Service`](https://docs.rs/tower/latest/tower/trait.Service.html) that screens `http::Request` traffic through the [guard-core-rs](https://github.com/Guard-Core/guard-core-rs) detection engine before forwarding it to the wrapped service. It contains no security logic of its own.
 
-- **Repository**: https://github.com/rennf93/tower-guard-rs
+- **Repository**: https://github.com/Guard-Core/tower-guard-rs
 - **Language**: Rust, edition 2024, MSRV 1.92
 - **License**: MIT OR Apache-2.0
 - **Version**: 0.1.0
@@ -57,7 +57,7 @@ The method is not scanned: `detect` has no method parameter. Non-UTF-8 header va
 - `Cargo.toml` declares `guard-core-engine = { path = "../guard-core-rs/crates/guard-core-engine" }`.
 - **TODO(engine):** switch to the versioned crates.io dependency once `guard-core-rs` is tagged and published.
 - The engine crate is used directly, not the `guard-core-rs` facade crate, because the facade re-exports only `compiler`, `preprocessor`, and `semantic`. If the facade later re-exports `detect`, switching is a one-line change.
-- CI checks out `rennf93/guard-core-rs` (branch `master`, moving branch by design, documented in `.github/workflows/ci.yml`) into `../guard-core-rs` before building, mirroring `laravel-guard`/`symfony-guard`. Do not replace that with a git dependency without updating the CI comment and this file.
+- CI checks out `Guard-Core/guard-core-rs` (branch `master`, moving branch by design, documented in `.github/workflows/ci.yml`) into `../guard-core-rs` before building, mirroring `laravel-guard`/`symfony-guard`. Do not replace that with a git dependency without updating the CI comment and this file.
 
 ## Development Commands
 
@@ -143,6 +143,6 @@ tower-guard-rs/
 
 ## Related Projects
 
-- [guard-core-rs](https://github.com/rennf93/guard-core-rs): Rust detection engine (this crate's dependency).
-- [axum-guard-rs](https://github.com/rennf93/axum-guard-rs): axum adapter over this crate.
-- [guard-core](https://github.com/rennf93/guard-core): Python reference implementation and spec owner.
+- [guard-core-rs](https://github.com/Guard-Core/guard-core-rs): Rust detection engine (this crate's dependency).
+- [axum-guard-rs](https://github.com/Guard-Core/axum-guard-rs): axum adapter over this crate.
+- [guard-core](https://github.com/Guard-Core/guard-core): Python reference implementation and spec owner.

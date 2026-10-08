@@ -2,10 +2,10 @@
 
 `tower-guard-rs` is application-layer security middleware for
 [tower](https://github.com/tower-rs/tower)-based services, powered by the
-[guard-core-rs](https://github.com/rennf93/guard-core-rs) detection engine.
-It is part of the [Guard ecosystem](https://github.com/rennf93). It works
+[guard-core-rs](https://github.com/Guard-Core/guard-core-rs) detection engine.
+It is part of the [Guard ecosystem](https://github.com/Guard-Core). It works
 with any framework built on `tower::Service`, including
-[axum](https://github.com/tokio-rs/axum) ([axum-guard-rs](https://github.com/rennf93/axum-guard-rs)
+[axum](https://github.com/tokio-rs/axum) ([axum-guard-rs](https://github.com/Guard-Core/axum-guard-rs)
 composes this crate), [hyper](https://github.com/hyperium/hyper), and
 [warp](https://github.com/seanmonstar/warp).
 
@@ -53,7 +53,7 @@ let layer = tower_guard_rs::GuardLayer::new(tower_guard_rs::default_config());
 let service = layer.layer(my_service);
 ```
 
-For axum, [axum-guard-rs](https://github.com/rennf93/axum-guard-rs) wraps
+For axum, [axum-guard-rs](https://github.com/Guard-Core/axum-guard-rs) wraps
 this layer with `with_guard(config)`.
 
 ## What it inspects

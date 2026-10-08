@@ -1,7 +1,7 @@
 # Examples
 
 The repository ships two runnable applications under
-[`examples/`](https://github.com/rennf93/tower-guard-rs/tree/master/examples).
+[`examples/`](https://github.com/Guard-Core/tower-guard-rs/tree/master/examples).
 Both use the real adapter surface (`GuardLayer` wrapped around a service).
 
 The example crates are workspace members and build against the in-repository
@@ -11,7 +11,7 @@ checkout (see the repository README).
 ## simple_app
 
 A minimal guarded service served over hyper
-([`examples/simple_app`](https://github.com/rennf93/tower-guard-rs/tree/master/examples/simple_app)):
+([`examples/simple_app`](https://github.com/Guard-Core/tower-guard-rs/tree/master/examples/simple_app)):
 
 | Route | Guard | Behavior |
 |---|---|---|
@@ -33,7 +33,7 @@ cargo run -p tower-guard-simple-app
 ## advanced_app
 
 A production-shaped guarded service
-([`examples/advanced_app`](https://github.com/rennf93/tower-guard-rs/tree/master/examples/advanced_app))
+([`examples/advanced_app`](https://github.com/Guard-Core/tower-guard-rs/tree/master/examples/advanced_app))
 that demonstrates the two knobs a real deployment tunes: environment-driven
 engine configuration and route-scoped guard configuration. `/admin/*`
 traffic is screened by a second, stricter `GuardLayer` (threat-score

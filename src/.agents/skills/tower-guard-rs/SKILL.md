@@ -1,6 +1,6 @@
 ---
 name: tower-guard-rs
-description: Use when working in the tower-guard-rs Rust crate (github.com/rennf93/tower-guard-rs): editing the tower Layer/Service security middleware, adding or changing engine view mapping (url_path/query_param/header/request_body), changing the request body buffering cap or the 403/413/500 fail-secure response translation, wiring the guard-core-rs engine dependency (path vs versioned, CI checkout), or answering questions about what the adapter inspects and blocks. Covers CI-verified cargo commands, the EXCLUDED_HEADERS policy, and the cfg(test) detector seam for panic-recovery tests.
+description: Use when working in the tower-guard-rs Rust crate (github.com/Guard-Core/tower-guard-rs): editing the tower Layer/Service security middleware, adding or changing engine view mapping (url_path/query_param/header/request_body), changing the request body buffering cap or the 403/413/500 fail-secure response translation, wiring the guard-core-rs engine dependency (path vs versioned, CI checkout), or answering questions about what the adapter inspects and blocks. Covers CI-verified cargo commands, the EXCLUDED_HEADERS policy, and the cfg(test) detector seam for panic-recovery tests.
 ---
 
 # tower-guard-rs
@@ -53,7 +53,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 - `panic = "abort"` disables the `catch_unwind` recovery; the process dies before the `500` can be returned. Documented, not mitigated.
 - The panic test relies on `#[cfg(test)] GuardLayer::with_detect_fn`. It does not exist in production builds; do not make it public.
 - `axum::body::Body` implements `From<Bytes>` but not `From<Full<Bytes>>`. That is why the rebuild bound is `From<Bytes>`; do not "simplify" it back.
-- The engine dependency is a path dependency (`../guard-core-rs/crates/guard-core-engine`) with a `TODO(engine)` to move to the versioned crate. CI checks out `rennf93/guard-core-rs@master` into place. The facade crate `guard-core-rs` is NOT used because it does not re-export `detect`.
+- The engine dependency is a path dependency (`../guard-core-rs/crates/guard-core-engine`) with a `TODO(engine)` to move to the versioned crate. CI checks out `Guard-Core/guard-core-rs@master` into place. The facade crate `guard-core-rs` is NOT used because it does not re-export `detect`.
 - Payloads in tests must come from the spec 4.0.2 corpus (`guard-core-rs/conformance/guard-core-spec-4.0.2/cases/`) so they are guaranteed threats.
 
 ## Related
