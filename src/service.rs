@@ -316,6 +316,20 @@ where
                 );
             }
 
+            // The country-verdict lines (the reference
+            // `_log_country_check_result`): the non-block verdicts ride
+            // `log_country_check_level`, blocks ride
+            // `log_suspicious_level` (compose-only, like check 4).
+            if let (Some(observability), Some(stage)) =
+                (layer.observability(), layer.geo_blocking())
+            {
+                let _ = stage.country_check_log(
+                    facts.ip,
+                    observability.log_suspicious_level,
+                    observability.log_country_check_level,
+                );
+            }
+
             // Check 5: the request body buffers under the size cap
             // (413) - the reference `request_size_content` stage. The
             // route's `max_request_size` replaces the global cap for the
@@ -1163,6 +1177,81 @@ mod tests {
         status_and_body(&layer, request).await
     }
 
+    async fn config_status_and_body_layer(
+        layer: &GuardLayer,
+        request: Request<Full<Bytes>>,
+    ) -> (StatusCode, String) {
+        status_and_body(layer, request).await
+    }
+
+    #[tokio::test]
+    async fn the_country_level_alone_installs_observability_and_composes() {
+        // A suspicious level of None with the country level set: the
+        // observability config installs for the country verdicts alone.
+        let config = SecurityConfig {
+            log_suspicious_level: None,
+            blocked_countries: [String::from("RU")].into_iter().collect(),
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        let observability = layer.observability().expect("the country default");
+        assert_eq!(observability.log_suspicious_level, None);
+        assert!(
+            observability.log_country_check_level.is_some(),
+            "the INFO country default rides"
+        );
+
+        // A dispatch through the geo position composes the verdict line
+        // (compose-only: the host emits). The geo stage is a
+        // host-provided collaborator, installed as its own builder.
+        let geo = guard_core_rs::geo::GeoStage::new(guard_core_rs::geo::GeoStageConfig {
+            gate: guard_core_engine::geo::parse_country_lists([] as [&str; 0], ["RU"]),
+            handler: None,
+            passive_mode: false,
+        });
+        let layer = GuardLayer::from_security_config(&config)
+            .expect("valid config")
+            .with_geo_blocking(geo);
+        let (status, _) = config_status_and_body_layer(&layer, benign_request("203.0.113.9")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    #[tokio::test]
+    async fn the_log_level_knobs_feed_the_stage_surfaces() {
+        // `log_request_level` installs the request-logging stage; the
+        // country-verdict composer rides `log_country_check_level` off
+        // the observability config.
+        let config = SecurityConfig {
+            log_request_level: Some(guard_core_engine::security_config::LogLevel::Info),
+            log_country_check_level: Some(guard_core_engine::security_config::LogLevel::Debug),
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        assert!(
+            layer.request_logging().is_some(),
+            "the level installs the request-logging stage"
+        );
+        let observability = layer.observability().expect("country level installs it");
+        assert_eq!(
+            observability.log_request_level,
+            Some(guard_core_rs::logging::LogLevel::Info)
+        );
+        assert_eq!(
+            observability.log_country_check_level,
+            Some(guard_core_rs::logging::LogLevel::Debug)
+        );
+
+        // The reference default: no request level (no stage), the
+        // country level at its INFO default (observability installs).
+        let layer =
+            GuardLayer::from_security_config(&SecurityConfig::default()).expect("valid config");
+        assert!(layer.request_logging().is_none());
+        let observability = layer.observability().expect("the INFO country default");
+        assert_eq!(observability.log_request_level, None);
+        assert_eq!(
+            observability.log_country_check_level,
+            Some(guard_core_rs::logging::LogLevel::Info)
+        );
+    }
     #[tokio::test]
     async fn the_penetration_detection_toggle_skips_the_scan() {
         // `enable_penetration_detection = false` skips the multi-surface
@@ -1432,6 +1521,9 @@ mod tests {
     async fn from_security_config_silent_observability_skips_the_knob() {
         let config = SecurityConfig {
             log_suspicious_level: None,
+            // The INFO country default would install observability on
+            // its own; silence it too for the fully-silent surface.
+            log_country_check_level: None,
             ..SecurityConfig::default()
         };
         let layer = GuardLayer::from_security_config(&config).expect("valid config");
