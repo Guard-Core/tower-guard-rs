@@ -654,16 +654,47 @@ where
                 ));
             }
 
-            if !bypassed("clouds")
-                && let Some(stage) = layer.cloud_provider()
-                && let Some(decision) = stage.decide(facts.ip, facts.gate)
-            {
-                return Ok(block_response(
-                    &parts,
-                    &layer,
-                    decision.answer.status.as_u16(),
-                    stage_answer_body(&decision.answer),
-                ));
+            // The reference `get_cloud_providers_to_check` route-over-global
+            // resolution: the route's `block_cloud_providers` list replaces
+            // the global one for the request (an empty route list falls back
+            // to the global config); an invalid route selector fails secure
+            // (the reference validates at decoration time).
+            if !bypassed("clouds") {
+                let route_selectors = route
+                    .filter(|route| !route.block_cloud_providers.is_empty())
+                    .map(|route| {
+                        guard_core_engine::cloud_provider::parse_cloud_selectors(
+                            route.block_cloud_providers.iter().map(String::as_str),
+                        )
+                    });
+                match route_selectors {
+                    Some(Ok(selectors)) => {
+                        if let Some(stage) = layer.cloud_provider()
+                            && let Some(decision) =
+                                stage.decide_route(facts.ip, facts.gate, &selectors)
+                        {
+                            return Ok(block_response(
+                                &parts,
+                                &layer,
+                                decision.answer.status.as_u16(),
+                                stage_answer_body(&decision.answer),
+                            ));
+                        }
+                    }
+                    Some(Err(_)) => return Ok(failure_response(&parts, &layer)),
+                    None => {
+                        if let Some(stage) = layer.cloud_provider()
+                            && let Some(decision) = stage.decide(facts.ip, facts.gate)
+                        {
+                            return Ok(block_response(
+                                &parts,
+                                &layer,
+                                decision.answer.status.as_u16(),
+                                stage_answer_body(&decision.answer),
+                            ));
+                        }
+                    }
+                }
             }
 
             {
@@ -4135,6 +4166,39 @@ mod tests {
         assert_eq!(body, "Access not allowed at this time");
     }
 
+    /// The cloud stage (AWS + GCP tables, the global AWS list) behind a
+    /// carrier route naming `route_providers`.
+    fn route_cloud_layer(route_providers: &[&str]) -> GuardLayer {
+        let table = guard_core_rs::cloud_provider::CloudIpTable::default();
+        table
+            .set_provider_ranges("AWS", vec![(String::from("192.0.2.0/24"), None)])
+            .expect("valid ranges");
+        table
+            .set_provider_ranges("GCP", vec![(String::from("198.51.100.0/24"), None)])
+            .expect("valid ranges");
+        let cloud = guard_core_rs::cloud_provider::CloudProviderStage::builder(
+            guard_core_rs::cloud_provider::CloudProviderStageConfig {
+                block_cloud_providers: guard_core_rs::cloud_provider::parse_cloud_selectors([
+                    "AWS",
+                ])
+                .expect("valid selectors"),
+                table,
+                passive_mode: false,
+            },
+        )
+        .build();
+        let config = RouteConfig {
+            block_cloud_providers: route_providers
+                .iter()
+                .map(|provider| (*provider).to_owned())
+                .collect(),
+            ..RouteConfig::default()
+        };
+        GuardLayer::new(default_config())
+            .with_cloud_provider(cloud)
+            .with_route_configs(resolver_for(&[("GET", "/api")], config))
+    }
+
     #[tokio::test]
     async fn fused_geo_cloud_and_user_agent_blocks_resolve_the_answer_body() {
         let geo = guard_core_rs::geo::GeoStage::new(guard_core_rs::geo::GeoStageConfig {
@@ -4169,6 +4233,42 @@ mod tests {
         let (status, body) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, "Cloud provider IP not allowed");
+
+        // The RC2 route-over-global resolution: the route's GCP list
+        // replaces the global AWS list for its route (the AWS address the
+        // global lane blocks passes), an AWS route list blocks the AWS
+        // address, an empty route list falls back to the global config,
+        // and an invalid selector fails secure.
+        let layer = route_cloud_layer(&["GCP"]);
+        let (status, _) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the route list overrides the global"
+        );
+        let (status, _) = status_and_body(&layer, request_at("/other", "192.0.2.9")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the global list holds off-route"
+        );
+
+        let layer = route_cloud_layer(&["AWS"]);
+        let (status, body) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "Cloud provider IP not allowed");
+
+        let layer = route_cloud_layer(&[]);
+        let (status, _) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the empty route list falls back"
+        );
+
+        let layer = route_cloud_layer(&["Hetzner"]);
+        let (status, _) = status_and_body(&layer, request_at("/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "fails secure");
 
         let ua = guard_core_rs::user_agent::UserAgentStage::new(
             guard_core_rs::user_agent::UserAgentStageConfig {
