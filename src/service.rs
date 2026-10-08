@@ -14,6 +14,7 @@ use guard_core_engine::ip_gate::IpGateVerdict;
 use guard_core_engine::route_config::RouteConfig;
 use guard_core_rs::process_response::{RequestBits, ResponseBits};
 use guard_core_rs::responses::{build_block_payload, fire_block_hook, resolve_error_body};
+use guard_core_rs::stage_events::security_headers_applied_event;
 use guard_core_rs::tower::{RequestObservation, RouteRateLimits};
 use http::header::CONTENT_TYPE;
 use http::request::Parts;
@@ -609,6 +610,7 @@ where
         &ProcessorInput::from_facts(facts),
         response.status().as_u16(),
         response.headers_mut(),
+        ResponseLane::Forwarded,
     );
     if let Some(status) = modified
         && let Ok(code) = http::StatusCode::from_u16(status)
@@ -671,17 +673,70 @@ fn threat_finding(
     })
 }
 
+/// Which lane the response-side pass ran in: a forwarded response (the
+/// inner service answered) or a guard-generated answer (a block, the
+/// redirect, the oversize/failure shapes). The reference applies the
+/// security headers in both, but the `security_headers_applied` event
+/// fires only on the forwarded lane (`create_error_response` applies the
+/// headers without a request path, and the event sits behind
+/// `request_path`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponseLane {
+    Forwarded,
+    Generated,
+}
+
+/// The `security_headers_applied` funnel: when the security-header set
+/// lands on a forwarded response and a bus is installed, the composed
+/// event (the reference `_send_headers_applied_event`, the #103 composer)
+/// dispatches with the exact set the pass rendered - the count and the
+/// CSP/HSTS flags from the resolved config, before the CORS verdict and
+/// the response modifier touch the view. A disabled config, a generated
+/// lane, and an absent bus each stay silent.
+fn emit_headers_applied_event(
+    layer: &GuardLayer,
+    processor: &guard_core_rs::process_response::ResponseProcessor,
+    input: &ProcessorInput,
+    lane: ResponseLane,
+) {
+    if lane != ResponseLane::Forwarded {
+        return;
+    }
+    let Some(config) = processor.security_headers().filter(|config| config.enabled) else {
+        return;
+    };
+    let Some(bus) = &layer.events else {
+        return;
+    };
+    let set = guard_core_engine::security_headers::security_headers(config);
+    bus.send_event(&security_headers_applied_event(
+        &input.url_path,
+        set.len(),
+        set.contains_key("Content-Security-Policy"),
+        set.contains_key("Strict-Transport-Security"),
+        &input.client_ip,
+    ));
+}
+
 /// Run the response-side pass when a processor is installed: the global
 /// `return_pattern` rules evaluate the response (a crossed `ban` lands in
 /// the processor's IP-ban store), then the security-header set and the
 /// CORS verdict headers land on the response. The response body is not
 /// captured (`body_prefix = None`): `status:` rules evaluate, body rules
 /// skip, exactly the reference's no-capture seam.
+///
+/// The lane decides the `security_headers_applied` funnel: a forwarded
+/// response composes the event over the landed set and dispatches it over
+/// the installed bus (the reference `process_response` passes the request
+/// path, so the event fires), a guard-generated answer applies the headers
+/// without one (the reference `create_error_response` lane, where the
+/// event never fires).
 fn apply_response_processor(
     layer: &GuardLayer,
     input: &ProcessorInput,
     status: u16,
     headers: &mut HeaderMap,
+    lane: ResponseLane,
 ) -> Option<u16> {
     let processor = layer.response_processor()?;
     let mut bits = ResponseBits {
@@ -696,6 +751,7 @@ fn apply_response_processor(
         origin: input.origin.clone(),
     };
     let _action = processor.process(&request, &mut bits, None, SystemTime::now());
+    emit_headers_applied_event(layer, processor, input, lane);
 
     // The reference `custom_response_modifier`: the callback runs LAST
     // over the response view. A panicking callback restores the
@@ -752,6 +808,7 @@ fn finish_generated<B2>(
         &input,
         generated.status().as_u16(),
         generated.headers_mut(),
+        ResponseLane::Generated,
     );
     if let Some(status) = modified
         && let Ok(code) = http::StatusCode::from_u16(status)
@@ -942,7 +999,13 @@ fn block_response_owned(
 ) -> Response<Full<Bytes>> {
     let mut generated = response::blocked_with_body(status, body);
     let input = ProcessorInput::from_parts(parts);
-    let modified = apply_response_processor(layer, &input, status, generated.headers_mut());
+    let modified = apply_response_processor(
+        layer,
+        &input,
+        status,
+        generated.headers_mut(),
+        ResponseLane::Generated,
+    );
     if let Some(modified) = modified
         && let Ok(code) = http::StatusCode::from_u16(modified)
     {
@@ -2214,7 +2277,8 @@ mod tests {
             client_ip: "203.0.113.9".to_owned(),
             origin: None,
         };
-        let modified = apply_response_processor(&layer, &input, 200, &mut headers);
+        let modified =
+            apply_response_processor(&layer, &input, 200, &mut headers, ResponseLane::Forwarded);
         assert_eq!(modified, Some(201), "the status rewrite propagates");
         assert_eq!(
             headers
@@ -2247,7 +2311,8 @@ mod tests {
             client_ip: "203.0.113.9".to_owned(),
             origin: None,
         };
-        let modified = apply_response_processor(&layer, &input, 200, &mut headers);
+        let modified =
+            apply_response_processor(&layer, &input, 200, &mut headers, ResponseLane::Forwarded);
         assert_eq!(modified, None);
         assert!(
             headers.get("x-content-type-options").is_some(),
@@ -3165,6 +3230,159 @@ mod tests {
                 && event.action_taken == "request_blocked"
                 && event.handler_name.as_deref() == Some("rate_limit")),
             "the rate_limited event fired: {events:?}"
+        );
+    }
+
+    fn recording_bus(
+        sink: Arc<Mutex<Vec<guard_core_rs::events::SecurityEvent>>>,
+    ) -> Arc<guard_core_rs::events::SecurityEventBus> {
+        Arc::new(
+            guard_core_rs::events::SecurityEventBus::new(true).on_event(Arc::new(move |event| {
+                sink.lock().expect("events").push(event.clone());
+            })),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_forwarded_lane_dispatches_the_headers_applied_event() {
+        let events: Arc<Mutex<Vec<guard_core_rs::events::SecurityEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let layer = GuardLayer::new(default_config())
+            .with_response_processor(bare_processor())
+            .with_event_bus(recording_bus(Arc::clone(&events)));
+        let (status, _) = status_and_body(&layer, benign_request("192.0.2.80")).await;
+        assert_eq!(status, StatusCode::OK);
+        let set = guard_core_engine::security_headers::security_headers(
+            &guard_core_engine::security_headers::SecurityHeadersConfig::reference_default(),
+        );
+        {
+            let events = events.lock().expect("events");
+            let applied: Vec<&guard_core_rs::events::SecurityEvent> = events
+                .iter()
+                .filter(|event| event.event_type == "security_headers_applied")
+                .collect();
+            assert_eq!(
+                applied.len(),
+                1,
+                "one event per forwarded response: {events:?}"
+            );
+            let event = applied[0];
+            assert_eq!(event.action_taken, "headers_added");
+            assert_eq!(event.handler_name.as_deref(), Some("security_headers"));
+            assert_eq!(event.ip_address, "192.0.2.80");
+            assert_eq!(event.metadata["path"].as_str(), Some("/hello"));
+            // The count is the rendered security-header set, not the
+            // CORS-extended view: the request carries no Origin, so the
+            // two agree here, and the composer reads the resolved config
+            // either way. The reference default carries HSTS and no CSP.
+            assert_eq!(
+                event.metadata["headers_count"].as_u64(),
+                Some(set.len() as u64)
+            );
+            assert_eq!(event.metadata["has_csp"].as_bool(), Some(false));
+            assert_eq!(event.metadata["has_hsts"].as_bool(), Some(true));
+        }
+
+        // A CSP-bearing config flips the flag and grows the count.
+        let csp_events: Arc<Mutex<Vec<guard_core_rs::events::SecurityEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let with_csp = guard_core_rs::process_response::ResponseProcessor::new(
+            Some(guard_core_engine::security_headers::SecurityHeadersConfig {
+                csp: vec![guard_core_engine::security_headers::CspDirective {
+                    name: "default-src".to_owned(),
+                    sources: vec!["'self'".to_owned()],
+                }],
+                ..guard_core_engine::security_headers::SecurityHeadersConfig::reference_default()
+            }),
+            None,
+            Vec::new(),
+            Arc::new(std::sync::Mutex::new(
+                guard_core_engine::behavior::BehaviorTracker::new(),
+            )),
+            IpBanManager::new(),
+            false,
+            guard_core_engine::behavior::DEFAULT_MAX_RESPONSE_BODY_INSPECT_BYTES,
+            false,
+        );
+        let csp_layer = GuardLayer::new(default_config())
+            .with_response_processor(with_csp)
+            .with_event_bus(recording_bus(Arc::clone(&csp_events)));
+        let (status, _) = status_and_body(&csp_layer, benign_request("192.0.2.82")).await;
+        assert_eq!(status, StatusCode::OK);
+        let csp_events = csp_events.lock().expect("events");
+        let csp_event = csp_events
+            .iter()
+            .find(|event| event.event_type == "security_headers_applied")
+            .expect("the CSP event fired");
+        assert_eq!(csp_event.metadata["has_csp"].as_bool(), Some(true));
+        assert_eq!(
+            csp_event.metadata["headers_count"].as_u64(),
+            Some((set.len() + 1) as u64),
+            "the CSP header joins the set"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_generated_lane_applies_headers_without_the_event() {
+        // A guard block answers with the security-header set (the
+        // reference `create_error_response` applies the headers) but
+        // fires no event: that lane passes no request path.
+        let events: Arc<Mutex<Vec<guard_core_rs::events::SecurityEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let layer = GuardLayer::new(default_config())
+            .with_response_processor(bare_processor())
+            .with_event_bus(recording_bus(Arc::clone(&events)));
+        let (status, _) = status_and_body(&layer, attack_request("/hello?cmd=$(whoami)")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let events = events.lock().expect("events");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event_type != "security_headers_applied"),
+            "the generated lane stays silent: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_security_header_set_stays_silent() {
+        // The reference fires the event from `get_headers` behind the
+        // `enabled` gate: a disabled set renders nothing and dispatches
+        // nothing, even with a bus installed.
+        let events: Arc<Mutex<Vec<guard_core_rs::events::SecurityEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let disabled = guard_core_rs::process_response::ResponseProcessor::new(
+            Some(guard_core_engine::security_headers::SecurityHeadersConfig {
+                enabled: false,
+                ..guard_core_engine::security_headers::SecurityHeadersConfig::reference_default()
+            }),
+            None,
+            Vec::new(),
+            Arc::new(std::sync::Mutex::new(
+                guard_core_engine::behavior::BehaviorTracker::new(),
+            )),
+            IpBanManager::new(),
+            false,
+            guard_core_engine::behavior::DEFAULT_MAX_RESPONSE_BODY_INSPECT_BYTES,
+            false,
+        );
+        let layer = GuardLayer::new(default_config())
+            .with_response_processor(disabled)
+            .with_event_bus(recording_bus(Arc::clone(&events)));
+        let response = guarded(&layer)
+            .oneshot(benign_request("192.0.2.81"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get("x-content-type-options").is_none(),
+            "a disabled set renders no headers"
+        );
+        let events = events.lock().expect("events");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event_type != "security_headers_applied"),
+            "a disabled set stays silent: {events:?}"
         );
     }
 
