@@ -389,8 +389,10 @@ where
             // the pipeline stages that do (the reference's
             // `suspicious_activity` position, via the stage). The
             // reference `suspicious_activity` bypass skips the scan (and
-            // with it the violation feed) for the route.
-            let verdict = if bypassed("penetration") {
+            // with it the violation feed) for the route, and the global
+            // `enable_penetration_detection` toggle skips it everywhere
+            // (the request proceeds clean).
+            let verdict = if bypassed("penetration") || !layer.penetration_detection_enabled() {
                 None
             } else {
                 match scan_request(&parts, buffered.as_ref(), &layer) {
@@ -1145,6 +1147,14 @@ mod tests {
 
     use guard_core_engine::security_config::SecurityConfig;
 
+    fn attack_request(uri: &str) -> Request<Full<Bytes>> {
+        Request::builder()
+            .uri(uri)
+            .header("x-forwarded-for", "203.0.113.9")
+            .body(Full::new(Bytes::new()))
+            .expect("request")
+    }
+
     async fn config_status_and_body(
         config: &SecurityConfig,
         request: Request<Full<Bytes>>,
@@ -1153,6 +1163,29 @@ mod tests {
         status_and_body(&layer, request).await
     }
 
+    #[tokio::test]
+    async fn the_penetration_detection_toggle_skips_the_scan() {
+        // `enable_penetration_detection = false` skips the multi-surface
+        // scan entirely: the attack rides through clean (200).
+        let config = SecurityConfig {
+            enable_penetration_detection: false,
+            ..SecurityConfig::default()
+        };
+        let (status, _) = config_status_and_body(
+            &config,
+            attack_request("/scan?q=1%20UNION%20SELECT%20password"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the toggle disables the scan");
+
+        // The default (enabled) scans and blocks.
+        let (status, _) = config_status_and_body(
+            &SecurityConfig::default(),
+            attack_request("/scan?q=1%20UNION%20SELECT%20password"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
     #[tokio::test]
     async fn from_security_config_feeds_the_scan_budgets() {
         // The scan-budget knobs ride the unified config onto the scan
