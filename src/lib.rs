@@ -465,6 +465,11 @@ pub struct GuardLayer {
     /// The reference `exclude_paths`: request paths that bypass the whole
     /// pipeline (the docs/static carve-out).
     exclude_paths: Vec<String>,
+    /// The reference `enable_penetration_detection`: the global scan
+    /// toggle (the reference default `true`). `false` skips the
+    /// multi-surface detection scan entirely - the verdict pipeline
+    /// downstream (violations, auto-ban feed) sees a clean request.
+    penetration_detection_enabled: bool,
     /// The scan entry point (test-only panic injection).
     scan_fn: ScanFn,
     /// The stage built by [`GuardLayer::layer`](tower::Layer::layer) from
@@ -526,6 +531,7 @@ impl GuardLayer {
             user_agent: None,
             response_processor: None,
             exclude_paths: Vec::new(),
+            penetration_detection_enabled: true,
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
             stage: None,
             cloud_refresh: None,
@@ -543,6 +549,21 @@ impl GuardLayer {
     #[must_use]
     pub fn exclude_paths(&self) -> &[String] {
         &self.exclude_paths
+    }
+
+    /// The global scan toggle (`enable_penetration_detection`, the
+    /// reference default `true`).
+    pub(crate) const fn penetration_detection_enabled(&self) -> bool {
+        self.penetration_detection_enabled
+    }
+
+    /// Set the global scan toggle (`enable_penetration_detection`): the
+    /// reference default is enabled, so only a `false` changes behavior -
+    /// the detection scan is skipped and the request proceeds clean.
+    #[must_use]
+    pub fn with_penetration_detection(mut self, enabled: bool) -> Self {
+        self.penetration_detection_enabled = enabled;
+        self
     }
 
     /// Set the `exclude_paths` carve-out.
@@ -583,6 +604,7 @@ impl GuardLayer {
             max_json_depth: config.detection_max_json_depth,
         })
         .with_passive_mode(config.passive_mode)
+        .with_penetration_detection(config.enable_penetration_detection)
         .with_exclude_paths(config.exclude_paths.clone());
 
         if config.whitelist.is_some()
@@ -686,6 +708,8 @@ impl GuardLayer {
         if let Some(level) = config.log_suspicious_level {
             layer = layer.with_observability(ObservabilityConfig {
                 log_suspicious_level: Some(map_log_level(level)),
+                log_request_level: None,
+                log_country_check_level: None,
                 muted_check_logs: Some(config.muted_check_logs.iter().cloned().collect()),
                 sensitive: guard_core_rs::redact::SensitiveNames::new(
                     Some(&config.log_sensitive_headers.iter().cloned().collect()),
