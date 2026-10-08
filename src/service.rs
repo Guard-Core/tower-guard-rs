@@ -590,12 +590,17 @@ where
         .call(Request::from_parts(parts, rebuilt))
         .await?
         .map(GuardBody::Passthrough);
-    apply_response_processor(
+    let modified = apply_response_processor(
         layer,
         &ProcessorInput::from_facts(facts),
         response.status().as_u16(),
         response.headers_mut(),
     );
+    if let Some(status) = modified
+        && let Ok(code) = http::StatusCode::from_u16(status)
+    {
+        *response.status_mut() = code;
+    }
     Ok(response)
 }
 
@@ -663,10 +668,8 @@ fn apply_response_processor(
     input: &ProcessorInput,
     status: u16,
     headers: &mut HeaderMap,
-) {
-    let Some(processor) = layer.response_processor() else {
-        return;
-    };
+) -> Option<u16> {
+    let processor = layer.response_processor()?;
     let mut bits = ResponseBits {
         status,
         body: None,
@@ -679,6 +682,27 @@ fn apply_response_processor(
         origin: input.origin.clone(),
     };
     let _action = processor.process(&request, &mut bits, None, SystemTime::now());
+
+    // The reference `custom_response_modifier`: the callback runs LAST
+    // over the response view. A panicking callback restores the
+    // unmodified view (the reference's except arm) and reports through
+    // the `on_error` hook.
+    if let Some(modifier) = &layer.response_modifier {
+        let unmodified = bits.clone();
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| modifier(&mut bits)));
+        if outcome.is_err() {
+            bits = unmodified;
+            if let Some(hook) = &layer.on_error {
+                hook(
+                    "custom_response_modifier",
+                    "the response modifier panicked; returning unmodified response",
+                    &[("path".to_owned(), input.url_path.clone())],
+                );
+            }
+        }
+    }
+    let modified_status = (bits.status != status).then_some(bits.status);
     for (name, value) in bits.headers {
         #[cfg(not(coverage))] // unreachable: the processor renders the
         // engine's fixed security-header and CORS sets, always valid names
@@ -698,6 +722,7 @@ fn apply_response_processor(
             headers.insert(name, value);
         }
     }
+    modified_status
 }
 
 /// Guard-generated answer (a block, the redirect, the oversize/failure
@@ -708,12 +733,17 @@ fn finish_generated<B2>(
     mut generated: Response<Full<Bytes>>,
 ) -> Response<GuardBody<B2>> {
     let input = ProcessorInput::from_parts(parts);
-    apply_response_processor(
+    let modified = apply_response_processor(
         layer,
         &input,
         generated.status().as_u16(),
         generated.headers_mut(),
     );
+    if let Some(status) = modified
+        && let Ok(code) = http::StatusCode::from_u16(status)
+    {
+        *generated.status_mut() = code;
+    }
     generated.map(GuardBody::Generated)
 }
 
@@ -898,7 +928,12 @@ fn block_response_owned(
 ) -> Response<Full<Bytes>> {
     let mut generated = response::blocked_with_body(status, body);
     let input = ProcessorInput::from_parts(parts);
-    apply_response_processor(layer, &input, status, generated.headers_mut());
+    let modified = apply_response_processor(layer, &input, status, generated.headers_mut());
+    if let Some(modified) = modified
+        && let Ok(code) = http::StatusCode::from_u16(modified)
+    {
+        *generated.status_mut() = code;
+    }
     generated
 }
 
@@ -2067,6 +2102,132 @@ mod tests {
     }
 
     /// Status, body, and the `Retry-After` header of one guarded request.
+
+    #[test]
+    fn the_response_modifier_mutates_the_response_view() {
+        // The reference `custom_response_modifier`: the callback runs
+        // last over the response view - a header lands and a status
+        // rewrite propagates to the caller.
+        let layer = GuardLayer::new(default_config())
+            .with_response_processor(bare_processor())
+            .with_custom_response_modifier(Arc::new(|bits: &mut ResponseBits| {
+                bits.headers
+                    .insert("X-Modified-By".to_owned(), "guard".to_owned());
+                bits.status = 201;
+            }));
+        let mut headers = http::HeaderMap::new();
+        let input = ProcessorInput {
+            method: "GET".to_owned(),
+            url_path: "/hello".to_owned(),
+            client_ip: "203.0.113.9".to_owned(),
+            origin: None,
+        };
+        let modified = apply_response_processor(&layer, &input, 200, &mut headers);
+        assert_eq!(modified, Some(201), "the status rewrite propagates");
+        assert_eq!(
+            headers
+                .get("x-modified-by")
+                .and_then(|value| value.to_str().ok()),
+            Some("guard"),
+            "the modifier lands on the response view"
+        );
+    }
+
+    #[test]
+    fn a_panicking_response_modifier_restores_and_reports() {
+        let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let layer = GuardLayer::new(default_config())
+            .with_response_processor(bare_processor())
+            .with_custom_response_modifier(Arc::new(|_bits: &mut ResponseBits| {
+                panic!("modifier exploded");
+            }))
+            .with_on_error(Arc::new(move |stage, error, _context| {
+                sink.lock()
+                    .expect("sink")
+                    .push((stage.to_owned(), error.to_owned()));
+            }));
+        let mut headers = http::HeaderMap::new();
+        let input = ProcessorInput {
+            method: "GET".to_owned(),
+            url_path: "/hello".to_owned(),
+            client_ip: "203.0.113.9".to_owned(),
+            origin: None,
+        };
+        let modified = apply_response_processor(&layer, &input, 200, &mut headers);
+        assert_eq!(modified, None);
+        assert!(
+            headers.get("x-content-type-options").is_some(),
+            "the security headers survive the panicking modifier"
+        );
+        let seen = seen.lock().expect("sink");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "custom_response_modifier");
+    }
+
+    #[tokio::test]
+    async fn a_status_rewrite_propagates_on_forward_and_generated_answers() {
+        // Forward: the modifier's status rewrite reaches the client.
+        let config = SecurityConfig::default();
+        let layer = GuardLayer::from_security_config(&config)
+            .expect("valid config")
+            .with_custom_response_modifier(Arc::new(|bits: &mut ResponseBits| {
+                bits.status = 201;
+            }));
+        let (status, _) = status_and_body(&layer, benign_request("203.0.113.9")).await;
+        assert_eq!(status, StatusCode::CREATED, "the forward rewrite lands");
+
+        // Generated (the emergency-mode 503): the rewrite reaches the
+        // generated answer.
+        let config = SecurityConfig {
+            emergency_mode: true,
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config)
+            .expect("valid config")
+            .with_custom_response_modifier(Arc::new(|bits: &mut ResponseBits| {
+                bits.status = 418;
+            }));
+        let (status, _) = status_and_body(&layer, benign_request("203.0.113.9")).await;
+        assert_eq!(
+            status,
+            StatusCode::IM_A_TEAPOT,
+            "the generated-answer rewrite lands"
+        );
+
+        // The ip-gate's own block: the rewrite reaches the banned shape.
+        let config = SecurityConfig {
+            blacklist: vec![String::from("192.0.2.9")],
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config)
+            .expect("valid config")
+            .with_custom_response_modifier(Arc::new(|bits: &mut ResponseBits| {
+                bits.status = 418;
+            }));
+        let (status, _) = status_and_body(&layer, benign_request("192.0.2.9")).await;
+        assert_eq!(
+            status,
+            StatusCode::IM_A_TEAPOT,
+            "the gate block rewrite lands"
+        );
+    }
+    fn bare_processor() -> guard_core_rs::process_response::ResponseProcessor {
+        guard_core_rs::process_response::ResponseProcessor::new(
+            Some(guard_core_engine::security_headers::SecurityHeadersConfig::reference_default()),
+            None,
+            Vec::new(),
+            Arc::new(std::sync::Mutex::new(
+                guard_core_engine::behavior::BehaviorTracker::new(),
+            )),
+            IpBanManager::new(),
+            false,
+            guard_core_engine::behavior::DEFAULT_MAX_RESPONSE_BODY_INSPECT_BYTES,
+            false,
+        )
+    }
+
     async fn full_status(
         layer: &GuardLayer,
         request: Request<Full<Bytes>>,
