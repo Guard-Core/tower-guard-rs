@@ -61,6 +61,27 @@ impl<S> GuardService<S> {
     pub(crate) fn new(inner: S, layer: GuardLayer) -> Self {
         Self { inner, layer }
     }
+
+    /// The reference `reset()`: drop every rate-limit window through the
+    /// owning layer ([`GuardLayer::reset`]).
+    pub fn reset(&self) {
+        self.layer.reset();
+    }
+
+    /// The reference `refresh_cloud_ip_ranges`: schedule one background
+    /// cloud-ranges refresh ([`GuardLayer::refresh_cloud_ip_ranges`];
+    /// `false` with no scheduler installed or while one is in flight).
+    #[must_use]
+    pub fn refresh_cloud_ip_ranges(&self) -> bool {
+        self.layer.refresh_cloud_ip_ranges()
+    }
+
+    /// The reference `agent_stats` in its no-agent shape
+    /// ([`GuardLayer::agent_stats`]).
+    #[must_use]
+    pub const fn agent_stats(&self) -> crate::AgentStats {
+        self.layer.agent_stats()
+    }
 }
 
 impl<S: Clone> Clone for GuardService<S> {

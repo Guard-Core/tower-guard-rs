@@ -467,6 +467,22 @@ pub struct GuardLayer {
     /// The stage built by [`GuardLayer::layer`](tower::Layer::layer) from
     /// the fields above; `None` until the layer wraps a service.
     stage: Option<Arc<RateLimitStage>>,
+    /// The cloud-refresh seam the `refresh_cloud_ip_ranges` maintenance
+    /// call drives (the reference `refresh_cloud_ip_ranges`'s handler).
+    cloud_refresh: Option<(
+        Arc<guard_core_rs::geo_lifecycle::CloudRefreshScheduler>,
+        Arc<guard_core_engine::cloud_provider::CloudIpTable>,
+    )>,
+}
+
+/// The `agent_stats` answer (the reference middleware property shape):
+/// whether an agent is wired and whether its start degraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentStats {
+    /// Whether an agent handler is wired (`enabled`).
+    pub enabled: bool,
+    /// Whether the agent started with failures (`degraded`).
+    pub degraded: bool,
 }
 
 impl GuardLayer {
@@ -509,6 +525,7 @@ impl GuardLayer {
             exclude_paths: Vec::new(),
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
             stage: None,
+            cloud_refresh: None,
         }
     }
 
@@ -1140,6 +1157,61 @@ impl GuardLayer {
         self
     }
 
+    /// Install the cloud-refresh seam the [`GuardLayer::refresh_cloud_ip_ranges`]
+    /// maintenance call drives: the scheduler (the facade's
+    /// `CloudRefreshScheduler`, carrying the provider set and any endpoint
+    /// overrides) plus the table the refresh swaps ranges into - the same
+    /// table the cloud-provider stage consults (clones share the store).
+    #[must_use]
+    pub fn with_cloud_refresh_scheduler(
+        mut self,
+        scheduler: Arc<guard_core_rs::geo_lifecycle::CloudRefreshScheduler>,
+        table: Arc<guard_core_engine::cloud_provider::CloudIpTable>,
+    ) -> Self {
+        self.cloud_refresh = Some((scheduler, table));
+        self
+    }
+
+    /// The reference `refresh_cloud_ip_ranges` (fastapi-guard
+    /// `guard/middleware.py`): schedule one background cloud-ranges refresh
+    /// through the installed scheduler (single-flight: `false` while one
+    /// is in flight, the reference's concurrent-caller gate). No scheduler
+    /// installed answers `false` - the reference's no-op for an empty
+    /// `block_cloud_providers`. The refreshed ranges land in the shared
+    /// table (each provider's row restamps), so the status payload and the
+    /// blocking stage see them without a restart.
+    #[must_use]
+    pub fn refresh_cloud_ip_ranges(&self) -> bool {
+        match &self.cloud_refresh {
+            Some((scheduler, table)) => scheduler.schedule_refresh(table),
+            None => false,
+        }
+    }
+
+    /// The reference `reset()` (fastapi-guard `guard/middleware.py`):
+    /// drop every rate-limit window the guard tracks, so every identity
+    /// starts its windows afresh. The bans, violation counts, and the
+    /// cloud table are untouched - the reference resets the rate-limit
+    /// handler only.
+    pub fn reset(&self) {
+        if let Some(limiter) = &self.rate_limiter {
+            limiter.reset();
+        }
+    }
+
+    /// The reference `agent_stats` (fastapi-guard `guard/middleware.py`
+    /// property) in its no-agent shape: `{"enabled": false, "degraded":
+    /// false}`. The adapter owns no agent slot (the engine-to-agent seam
+    /// lives in `guard-core-rs` / `guard-agent-rs`), so the enabled arm
+    /// has no surface here yet.
+    #[must_use]
+    pub const fn agent_stats(&self) -> AgentStats {
+        AgentStats {
+            enabled: false,
+            degraded: false,
+        }
+    }
+
     /// Install the blocked user-agent stage (check 14): a `User-Agent`
     /// matching the global blocklist (or the route's) answers `403`
     /// (`User-Agent not allowed`), and a detection threat on the same
@@ -1357,6 +1429,139 @@ impl core::fmt::Debug for GuardLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use http_body_util::Full;
+
+    fn ip(literal: &str) -> std::net::IpAddr {
+        literal.parse().expect("ip")
+    }
+
+    #[test]
+    fn reset_drops_every_rate_limit_window() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enable_rate_limiting: true,
+            rate_limit: 1,
+            rate_limit_window: 60,
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let probe = limiter.clone();
+        let layer = GuardLayer::with_defaults().with_rate_limiting(limiter);
+        let client = ip("203.0.113.9");
+        // The first request passes, the second crosses the window.
+        assert!(probe.check(client, None).allowed);
+        assert!(!probe.check(client, None).allowed);
+
+        // The reference `reset()`: the same identity starts afresh.
+        layer.reset();
+        assert!(probe.check(client, None).allowed);
+    }
+
+    #[test]
+    fn refresh_cloud_ip_ranges_answers_false_without_a_scheduler() {
+        let layer = GuardLayer::with_defaults();
+        assert!(!layer.refresh_cloud_ip_ranges());
+    }
+
+    #[tokio::test]
+    async fn refresh_cloud_ip_ranges_schedules_through_the_installed_seam() {
+        let scheduler = Arc::new(
+            guard_core_rs::geo_lifecycle::CloudRefreshScheduler::new()
+                .with_providers(vec!["AWS"])
+                .with_provider_endpoint("AWS", String::from("http://127.0.0.1:1/aws-ranges")),
+        );
+        let table = Arc::new(guard_core_engine::cloud_provider::CloudIpTable::default());
+        let layer = GuardLayer::with_defaults()
+            .with_cloud_refresh_scheduler(Arc::clone(&scheduler), Arc::clone(&table));
+        // The schedule starts (the unroutable endpoint fails the fetch in
+        // the background thread, the single-flight gate clears when the
+        // body lands - the scheduler's own suite pins that).
+        assert!(layer.refresh_cloud_ip_ranges());
+        // The gate clears when the body lands (the failed fetch cleared
+        // the provider, the reference's failed-refresh shape).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while scheduler.refresh_in_flight() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!scheduler.refresh_in_flight());
+        // The service surface delegates to the layer (and stays a working
+        // service: one dispatch answers through).
+        let layer = GuardLayer::with_defaults();
+        let service: GuardService<_> = Layer::layer(
+            &layer,
+            tower::service_fn(|_: http::Request<Full<Bytes>>| async {
+                Ok::<_, std::convert::Infallible>(http::Response::new(Full::new(Bytes::new())))
+            }),
+        );
+        assert!(!service.refresh_cloud_ip_ranges());
+        let response = tower::ServiceExt::oneshot(service, downcast_free_request())
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), http::StatusCode::OK);
+    }
+
+    /// A request body the maintenance tests' `Full<Bytes>` upstreams
+    /// accept (the guard's request type is generic in `B`; the probe
+    /// request just needs to typecheck against the upstream).
+    fn downcast_free_request() -> http::Request<Full<Bytes>> {
+        http::Request::builder()
+            .uri("/health")
+            .body(Full::new(Bytes::new()))
+            .expect("static request")
+    }
+
+    #[tokio::test]
+    async fn the_service_surface_delegates_reset_to_the_layer() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enable_rate_limiting: true,
+            rate_limit: 1,
+            rate_limit_window: 60,
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let probe = limiter.clone();
+        let layer = GuardLayer::with_defaults().with_rate_limiting(limiter);
+        let service: GuardService<_> = Layer::layer(
+            &layer,
+            tower::service_fn(|_: http::Request<Full<Bytes>>| async {
+                Ok::<_, std::convert::Infallible>(http::Response::new(Full::new(Bytes::new())))
+            }),
+        );
+        let client = ip("203.0.113.9");
+        assert!(probe.check(client, None).allowed);
+        assert!(!probe.check(client, None).allowed);
+        service.reset();
+        assert!(probe.check(client, None).allowed);
+        // The wrapped service still answers after the maintenance call.
+        let response = tower::ServiceExt::oneshot(service, downcast_free_request())
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn agent_stats_answers_the_no_agent_shape() {
+        let layer = GuardLayer::with_defaults();
+        assert_eq!(
+            layer.agent_stats(),
+            AgentStats {
+                enabled: false,
+                degraded: false
+            }
+        );
+        let layer = GuardLayer::with_defaults();
+        let service: GuardService<_> = Layer::layer(
+            &layer,
+            tower::service_fn(|_: http::Request<Full<Bytes>>| async {
+                Ok::<_, std::convert::Infallible>(http::Response::new(Full::new(Bytes::new())))
+            }),
+        );
+        assert_eq!(service.agent_stats(), layer.agent_stats());
+        let response = tower::ServiceExt::oneshot(service, downcast_free_request())
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), http::StatusCode::OK);
+    }
 
     #[test]
     fn guard_config_error_display_and_source_cover_every_variant() {
