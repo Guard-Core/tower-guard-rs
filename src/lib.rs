@@ -2,8 +2,8 @@
 //!
 //! Application-layer security middleware for
 //! [tower](https://github.com/tower-rs/tower)-based services, powered by the
-//! [guard-core-rs](https://github.com/rennf93/guard-core-rs) detection engine.
-//! Part of the [Guard ecosystem](https://github.com/rennf93). It works with
+//! [guard-core-rs](https://github.com/Guard-Core/guard-core-rs) detection engine.
+//! Part of the [Guard ecosystem](https://github.com/Guard-Core). It works with
 //! any framework built on [`tower::Service`], including
 //! [axum](https://github.com/tokio-rs/axum) (the [`axum-guard-rs`] wrapper
 //! composes this crate), [hyper](https://github.com/hyperium/hyper), and
@@ -162,7 +162,7 @@
 //! # });
 //! ```
 //!
-//! [`axum-guard-rs`]: https://github.com/rennf93/axum-guard-rs
+//! [`axum-guard-rs`]: https://github.com/Guard-Core/axum-guard-rs
 
 mod body;
 mod response;
@@ -392,7 +392,7 @@ impl core::fmt::Debug for BanState {
 /// on the [`tower::Service`] implementation (see [`GuardService`]), which
 /// includes `axum`'s `Router` (and therefore [`axum-guard-rs`]).
 ///
-/// [`axum-guard-rs`]: https://github.com/rennf93/axum-guard-rs
+/// [`axum-guard-rs`]: https://github.com/Guard-Core/axum-guard-rs
 ///
 /// # Example
 ///

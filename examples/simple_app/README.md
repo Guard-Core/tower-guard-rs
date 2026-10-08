@@ -1,7 +1,7 @@
 # simple_app
 
 Minimal guarded service for tower: a tiny hand-rolled router wrapped in
-[`tower_guard_rs::GuardLayer`](https://github.com/rennf93/tower-guard-rs) and
+[`tower_guard_rs::GuardLayer`](https://github.com/Guard-Core/tower-guard-rs) and
 served over hyper. Every detection decision comes from the guard-core-rs
 engine; the example itself holds no security logic.
 

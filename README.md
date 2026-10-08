@@ -1,10 +1,10 @@
 # tower-guard-rs
 
-Application-layer security middleware for [tower](https://github.com/tower-rs/tower)-based services, powered by the [guard-core-rs](https://github.com/rennf93/guard-core-rs) detection engine. Part of the [guard ecosystem](https://github.com/rennf93).
+Application-layer security middleware for [tower](https://github.com/tower-rs/tower)-based services, powered by the [guard-core-rs](https://github.com/Guard-Core/guard-core-rs) detection engine. Part of the [guard ecosystem](https://github.com/Guard-Core).
 
-Docs: <https://rennf93.github.io/tower-guard-rs/>
+Docs: <https://guard-core.github.io/tower-guard-rs/>
 
-Works with any framework built on `tower::Service`, including [axum](https://github.com/tokio-rs/axum) (see [axum-guard-rs](https://github.com/rennf93/axum-guard-rs)), [hyper](https://github.com/hyperium/hyper), and [warp](https://github.com/seanmonstar/warp).
+Works with any framework built on `tower::Service`, including [axum](https://github.com/tokio-rs/axum) (see [axum-guard-rs](https://github.com/Guard-Core/axum-guard-rs)), [hyper](https://github.com/hyperium/hyper), and [warp](https://github.com/seanmonstar/warp).
 
 **Status:** Released. Version 1.2.0, published to crates.io. `GuardLayer` and `GuardService` are working `tower` middleware over `http::Request<B>`, screened by the engine.
 
@@ -12,9 +12,9 @@ Works with any framework built on `tower::Service`, including [axum](https://git
 
 The guard ecosystem provides application-layer API security middleware across multiple languages and frameworks:
 
-- **Python**: [fastapi-guard](https://github.com/rennf93/fastapi-guard), [flaskapi-guard](https://github.com/rennf93/flaskapi-guard), [djapi-guard](https://github.com/rennf93/djapi-guard), [tornadoapi-guard](https://github.com/rennf93/tornadoapi-guard)
+- **Python**: [fastapi-guard](https://github.com/Guard-Core/fastapi-guard), [flaskapi-guard](https://github.com/Guard-Core/flaskapi-guard), [djapi-guard](https://github.com/Guard-Core/djapi-guard), [tornadoapi-guard](https://github.com/Guard-Core/tornadoapi-guard)
 - **TypeScript**: guard-core-ts with adapters for Express, Fastify, Hono, NestJS
-- **Rust**: [guard-core-rs](https://github.com/rennf93/guard-core-rs) with adapters for tower (this repo), [axum](https://github.com/rennf93/axum-guard-rs), [actix-web](https://github.com/rennf93/actix-guard-rs), and [rocket](https://github.com/rennf93/rocket-guard-rs)
+- **Rust**: [guard-core-rs](https://github.com/Guard-Core/guard-core-rs) with adapters for tower (this repo), [axum](https://github.com/Guard-Core/axum-guard-rs), [actix-web](https://github.com/Guard-Core/actix-guard-rs), and [rocket](https://github.com/Guard-Core/rocket-guard-rs)
 
 Per the ecosystem boundary rules, this crate holds framework glue only: every detection decision comes from the engine.
 
@@ -29,7 +29,7 @@ let layer = tower_guard_rs::GuardLayer::new(tower_guard_rs::default_config());
 let service = layer.layer(my_service);
 ```
 
-For axum, [axum-guard-rs](https://github.com/rennf93/axum-guard-rs) wraps this layer with `with_guard(config)`. The full crate documentation is in [`src/lib.rs`](src/lib.rs) (build it with `cargo doc --open`).
+For axum, [axum-guard-rs](https://github.com/Guard-Core/axum-guard-rs) wraps this layer with `with_guard(config)`. The full crate documentation is in [`src/lib.rs`](src/lib.rs) (build it with `cargo doc --open`).
 
 ## What it inspects
 
@@ -93,11 +93,11 @@ A body larger than the cap is rejected with `413` rather than forwarded unscanne
 
 ## WebSocket upgrades
 
-WebSocket upgrades are not guarded by this adapter. A tower service sees the upgrade request like any other, but the upgrade itself completes at the hyper connection level (hyper's `on_upgrade` runtime), outside the `tower::Service` contract this crate is written against - there is no framework surface here to reject a handshake with the reference's close shapes. The guard exists where the framework exposes the upgrade: axum applications use [`axum-guard-rs`](https://github.com/rennf93/axum-guard-rs)'s `websocket::WebSocketGuard` (1008 policy / 1013 try-again-later close semantics, 403 pre-accept), and actix Web applications use `actix-guard-rs`'s `websocket::WebSocketGuard`. Plain requests (upgrade or not) still pass through this crate's checks as always.
+WebSocket upgrades are not guarded by this adapter. A tower service sees the upgrade request like any other, but the upgrade itself completes at the hyper connection level (hyper's `on_upgrade` runtime), outside the `tower::Service` contract this crate is written against - there is no framework surface here to reject a handshake with the reference's close shapes. The guard exists where the framework exposes the upgrade: axum applications use [`axum-guard-rs`](https://github.com/Guard-Core/axum-guard-rs)'s `websocket::WebSocketGuard` (1008 policy / 1013 try-again-later close semantics, 403 pre-accept), and actix Web applications use `actix-guard-rs`'s `websocket::WebSocketGuard`. Plain requests (upgrade or not) still pass through this crate's checks as always.
 
 ## Engine dependency
 
-The Cargo.toml pins `guard-core-engine` and `guard-core-rs` at 4.2.0 and carries paths pointing at the sibling `guard-core-rs` checkout (`../guard-core-rs/crates/guard-core-engine`, `../guard-core-rs/crates/guard-core-rs`) so local builds and CI compile the engine from source. Registry note, stated plainly: the 4.1.0 dists were yanked (the version-accuracy fix for the family tag mistake), so the 1.1.0 of this crate could not resolve its engine from the registry alone; the synchronized 4.2.0 train restores resolution (`tower-guard-rs` 1.2.0 over `guard-core-engine`/`guard-core-rs` 4.2.0). CI checks out `rennf93/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `laravel-guard`/`symfony-guard`.
+The Cargo.toml pins `guard-core-engine` and `guard-core-rs` at 4.2.0 and carries paths pointing at the sibling `guard-core-rs` checkout (`../guard-core-rs/crates/guard-core-engine`, `../guard-core-rs/crates/guard-core-rs`) so local builds and CI compile the engine from source. Registry note, stated plainly: the 4.1.0 dists were yanked (the version-accuracy fix for the family tag mistake), so the 1.1.0 of this crate could not resolve its engine from the registry alone; the synchronized 4.2.0 train restores resolution (`tower-guard-rs` 1.2.0 over `guard-core-engine`/`guard-core-rs` 4.2.0). CI checks out `Guard-Core/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `laravel-guard`/`symfony-guard`.
 
 The adapter now depends on both halves of the sibling checkout: the `guard-core-engine` crate (detection, rate limiting, bans, exclusions, geo, distributed traits) and the `guard-core-rs` facade (the event bus, the log/redaction port, the `on_block`/custom-error contract, and the rate-limit stage the layer delegates to), both pinned at 4.2.0 with path fallbacks into `../guard-core-rs`.
 

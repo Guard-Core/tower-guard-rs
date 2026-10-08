@@ -1,8 +1,8 @@
 site_name: tower-guard-rs
 site_description: Application-layer security middleware for tower services, powered by the guard-core-rs detection engine
 site_author: Renn F
-repo_url: https://github.com/rennf93/tower-guard-rs
-repo_name: rennf93/tower-guard-rs
+repo_url: https://github.com/Guard-Core/tower-guard-rs
+repo_name: Guard-Core/tower-guard-rs
 
 theme:
   name: material
