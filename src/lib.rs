@@ -1019,7 +1019,13 @@ impl GuardLayer {
 
     /// Install the [`SecurityEventBus`] the stage's security events
     /// dispatch through (`penetration_attempt`, `rate_limited`,
-    /// `ip_banned`, with the reference fields and metadata). Handlers
+    /// `ip_banned`, with the reference fields and metadata). The
+    /// response-side pass joins the stream: when the security-header set
+    /// lands on a forwarded response, the composed
+    /// `security_headers_applied` event (action `headers_added`, the
+    /// display-redacted path plus `headers_count`/`has_csp`/`has_hsts`)
+    /// dispatches too; guard-generated answers apply the headers without
+    /// firing (the reference's `create_error_response` lane). Handlers
     /// receive every event and own the transport.
     #[must_use]
     pub fn with_event_bus(mut self, bus: Arc<SecurityEventBus>) -> Self {
