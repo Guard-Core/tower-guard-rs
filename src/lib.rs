@@ -1576,11 +1576,11 @@ mod tests {
         assert!(layer.refresh_cloud_ip_ranges());
         // The gate clears when the body lands (the failed fetch cleared
         // the provider, the reference's failed-refresh shape).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while scheduler.refresh_in_flight() && std::time::Instant::now() < deadline {
+        let settled = (0..500).any(|_| {
             std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(!scheduler.refresh_in_flight());
+            !scheduler.refresh_in_flight()
+        });
+        assert!(settled);
         // The service surface delegates to the layer (and stays a working
         // service: one dispatch answers through).
         let layer = GuardLayer::with_defaults();
