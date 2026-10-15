@@ -218,6 +218,7 @@ pub use guard_core_rs::headers_auth::{
 pub use guard_core_rs::https_enforcement::{
     HttpsEnforcementStage, HttpsRedirectAnswer as HttpsRedirect,
 };
+pub use guard_core_rs::metrics::MetricsCollector;
 pub use guard_core_rs::process_response::ResponseProcessor;
 pub use guard_core_rs::request_logging::{RequestLoggingStage, RequestLoggingStageConfig};
 pub use guard_core_rs::responses::{BlockPayload, CustomErrorResponses, OnBlockHook};
@@ -468,6 +469,10 @@ pub struct GuardLayer {
     /// The response-side pass (behavioral return rules + security headers
     /// + CORS) applied to every response the guard touches.
     response_processor: Option<Arc<ResponseProcessor>>,
+    /// The reference `MetricsCollector` the forwarded-response path feeds
+    /// (`collect_request_metrics`: request count, response time, error
+    /// rate); `None` emits nothing.
+    metrics: Option<MetricsCollector>,
     /// The reference `exclude_paths`: request paths that bypass the whole
     /// pipeline (the docs/static carve-out).
     exclude_paths: Vec<String>,
@@ -538,6 +543,7 @@ impl GuardLayer {
             cloud_provider: None,
             user_agent: None,
             response_processor: None,
+            metrics: None,
             exclude_paths: Vec::new(),
             penetration_detection_enabled: true,
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
@@ -1329,6 +1335,21 @@ impl GuardLayer {
     #[must_use]
     pub fn with_response_processor(mut self, processor: ResponseProcessor) -> Self {
         self.response_processor = Some(Arc::new(processor));
+        self
+    }
+
+    /// Install the reference `MetricsCollector` (the `agent_enable_metrics`
+    /// emission point): every response the wrapped service produces for a
+    /// request the guard let through emits the reference
+    /// `collect_request_metrics` samples - `request_count`, `response_time`
+    /// (seconds from the request reaching the guard until the wrapped
+    /// service returns the response head, like the reference stopping at
+    /// response start) and, for a `>= 400` status, `error_rate`. Guard
+    /// block answers and `exclude_paths` bypasses emit nothing. The
+    /// collector owns the `agent_enable_metrics` gate and the transport.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: MetricsCollector) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
