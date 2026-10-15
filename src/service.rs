@@ -108,6 +108,8 @@ impl<S: std::fmt::Debug> std::fmt::Debug for GuardService<S> {
 enum BufferFailure {
     /// The body exceeded the buffering cap; reading stopped early.
     TooLarge,
+    /// The body did not arrive within `body_read_timeout`.
+    TimedOut,
     /// The body stream errored mid-read. The underlying error is dropped on
     /// purpose: it is body-transport noise (client abort, socket reset), not
     /// a security signal, and it must not leak into the `500` response.
@@ -147,7 +149,8 @@ where
     #[allow(clippy::too_many_lines)] // the reference pipeline order, one arm per check
     fn call(&mut self, request: Request<B>) -> Self::Future {
         let inner = self.inner.clone();
-        let layer = self.layer.clone();
+        let mut layer = self.layer.clone();
+        layer.refresh_live();
         Box::pin(async move {
             let started = Instant::now();
             let (mut parts, mut body) = request.into_parts();
@@ -200,6 +203,19 @@ where
                 });
             let route = route_carrier.as_deref();
 
+            // The reference `RouteConfigCheck` (it also runs on the scoped
+            // pipeline): a request the framework could not resolve to a route
+            // is refused under `route_resolution_strict`.
+            if layer.route_resolution_strict()
+                && parts
+                    .extensions
+                    .get::<crate::GuardRouteUnresolved>()
+                    .is_some()
+                && let Some(response) = unresolved_route_response(&parts, &layer, &facts)
+            {
+                return Ok(response);
+            }
+
             // The reference `handle_security_bypass`: a route that bypasses
             // "all" checks is forwarded to the real downstream service and
             // only the response modifier runs (no checks, no metrics, no
@@ -209,39 +225,6 @@ where
                 emit_security_bypass_event(&layer, &facts, route.expect("checked above"));
                 if !layer.passive_mode {
                     return forward_bypassed(&layer, &facts, parts, body, inner).await;
-                }
-            }
-
-            // The reference `process_usage_rules`: the route's usage and
-            // frequency behavior rules track the request observation and a
-            // crossed threshold dispatches the rule's action (a `ban`
-            // lands in the shared ban manager and renders the banned
-            // shape). The behavioral processor runs before the check
-            // pipeline (the reference dispatches it from the middleware's
-            // request pass).
-            let route_rules: &[guard_core_engine::behavior::BehaviorRule] =
-                route.map_or(&[], |route| &route.behavior_rules);
-            if !scoped
-                && !route_rules.is_empty()
-                && let Some(processor) = layer.response_processor()
-            {
-                let endpoint_id = format!("{}:{}", facts.method, facts.path);
-                let actions = processor.process_usage_rules(
-                    &endpoint_id,
-                    &facts.ip.map_or_else(String::new, |ip| ip.to_string()),
-                    route_rules,
-                    std::time::SystemTime::now(),
-                );
-                if actions
-                    .iter()
-                    .any(guard_core_engine::behavior::BehaviorAction::is_ban)
-                {
-                    return Ok(block_response(
-                        &parts,
-                        &layer,
-                        403,
-                        crate::ACTIVITY_BANNED_MESSAGE,
-                    ));
                 }
             }
 
@@ -506,10 +489,18 @@ where
                 .and_then(|route| route.max_request_size)
                 .and_then(|size| usize::try_from(size).ok())
                 .unwrap_or_else(|| layer.body_cap());
-            let buffered = match buffer_body(&mut body, body_cap).await {
+            let buffered = match buffer_body_bounded(&mut body, body_cap, &layer).await {
                 Ok(buffered) => buffered,
                 Err(BufferFailure::TooLarge) => {
                     return Ok(oversize_response(&parts, &layer));
+                }
+                Err(BufferFailure::TimedOut) => {
+                    return Ok(block_response(
+                        &parts,
+                        &layer,
+                        guard_core_engine::request_limits::BODY_READ_TIMEOUT_STATUS,
+                        guard_core_engine::request_limits::BODY_READ_TIMEOUT_MESSAGE,
+                    ));
                 }
                 Err(BufferFailure::Read) => {
                     return Ok(failure_response(&parts, &layer));
@@ -928,6 +919,39 @@ where
                 return Ok(block_response(&parts, &layer, status, ""));
             }
 
+            // The reference `process_usage_rules`: after the whole pipeline
+            // passed (`dispatch` runs `behavioral_processor.process_usage_rules`
+            // between `_handle_pipeline_block` and `call_next`), the route's
+            // usage and frequency behavior rules track the request
+            // observation and a crossed threshold dispatches the rule's action
+            // (a `ban` lands in the shared ban manager and renders the banned
+            // shape). A request the pipeline blocked never reaches it, and
+            // neither does an unattributed one (`and client_ip`).
+            if let Some(route) = route
+                && !route.behavior_rules.is_empty()
+                && let Some(ip) = facts.ip
+                && let Some(processor) = layer.response_processor()
+            {
+                let endpoint_id = format!("{}:{}", facts.method, facts.path);
+                let actions = processor.process_usage_rules(
+                    &endpoint_id,
+                    &ip.to_string(),
+                    &route.behavior_rules,
+                    std::time::SystemTime::now(),
+                );
+                if actions
+                    .iter()
+                    .any(guard_core_engine::behavior::BehaviorAction::is_ban)
+                {
+                    return Ok(block_response(
+                        &parts,
+                        &layer,
+                        403,
+                        crate::ACTIVITY_BANNED_MESSAGE,
+                    ));
+                }
+            }
+
             let rebuilt = B::from(buffered.unwrap_or_default());
             forward(&layer, &facts, parts, rebuilt, started, inner, false).await
         })
@@ -1003,6 +1027,61 @@ fn unresolved_client_response<B2>(parts: &Parts, layer: &GuardLayer) -> Response
         UNRESOLVABLE_CLIENT_ADDRESS_MESSAGE,
     );
     block_response(parts, layer, status, &body)
+}
+
+/// The reference `RouteConfigCheck._handle_unresolved_route`: the
+/// `route_unresolved` event, and the `500 Route resolution failed` answer
+/// unless `passive_mode` (log only). `None` when the request continues.
+fn unresolved_route_response<B2>(
+    parts: &Parts,
+    layer: &GuardLayer,
+    facts: &RequestFacts,
+) -> Option<Response<GuardBody<B2>>> {
+    use guard_core_engine::route_config::{
+        UNRESOLVED_ROUTE_CHECK_NAME, UNRESOLVED_ROUTE_MESSAGE, UNRESOLVED_ROUTE_REASON,
+        UNRESOLVED_ROUTE_STATUS,
+    };
+    if let Some(bus) = &layer.events {
+        let mut event = guard_core_rs::events::SecurityEvent::new(
+            guard_core_rs::event_types::EVENT_ROUTE_UNRESOLVED,
+            &facts.ip_string,
+            if layer.passive_mode {
+                "logged_only"
+            } else {
+                "request_blocked"
+            },
+            UNRESOLVED_ROUTE_REASON,
+            "middleware",
+        );
+        event.endpoint = Some(guard_core_rs::redact::redact_url_for_display(
+            &facts.path,
+            &sensitive_names(layer),
+        ));
+        event.method = Some(facts.method.clone());
+        bus.send_event(&event);
+    }
+    let observation = request_observation(parts);
+    let payload = build_block_payload(
+        UNRESOLVED_ROUTE_CHECK_NAME,
+        UNRESOLVED_ROUTE_REASON,
+        "",
+        layer.passive_mode,
+        &facts.ip_string,
+        observation.url.as_deref().unwrap_or("/"),
+        observation.method.as_deref().unwrap_or(""),
+        Some(UNRESOLVED_ROUTE_STATUS),
+        &sensitive_names(layer),
+    );
+    fire_block_hook(layer.on_block(), &payload);
+    if layer.passive_mode {
+        return None;
+    }
+    let body = resolve_error_body(
+        layer.custom_error_responses(),
+        UNRESOLVED_ROUTE_STATUS,
+        UNRESOLVED_ROUTE_MESSAGE,
+    );
+    Some(block_response(parts, layer, UNRESOLVED_ROUTE_STATUS, &body))
 }
 
 /// The reference `security_bypass` event of an all-checks-bypass route.
@@ -1568,6 +1647,34 @@ fn block_response_owned(
         *generated.status_mut() = code;
     }
     generated
+}
+
+/// [`buffer_body`] raced against the layer's `body_read_timeout` timer (the
+/// reference `body_read_timeout`); unbounded when the host installed no timer.
+async fn buffer_body_bounded<B>(
+    body: &mut B,
+    cap: usize,
+    layer: &GuardLayer,
+) -> Result<Option<Bytes>, BufferFailure>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
+    let Some((timeout, timer)) = layer.body_read_bound() else {
+        return buffer_body(body, cap).await;
+    };
+    let mut elapsed = timer(timeout);
+    let mut read = std::pin::pin!(buffer_body(body, cap));
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(result) = read.as_mut().poll(cx) {
+            return Poll::Ready(result);
+        }
+        if elapsed.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(BufferFailure::TimedOut));
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 /// Buffer a request body up to `cap` bytes.
@@ -2162,8 +2269,15 @@ mod tests {
             whitelist: Some(vec![String::from("not-an-ip")]),
             ..SecurityConfig::default()
         };
+        // The validator names the bad list first.
         let error = GuardLayer::from_security_config(&config).unwrap_err();
-        assert!(matches!(error, crate::GuardConfigError::IpGate(_)));
+        assert!(matches!(error, crate::GuardConfigError::Config(_)));
+        // The stage constructor stays the second line of defence for an
+        // unvalidated config.
+        let error = crate::Wiring::build_unvalidated(&config, &crate::WiringOptions::default())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(error, crate::WiringError::IpGate(_)));
     }
 
     #[tokio::test]
@@ -2328,7 +2442,11 @@ mod tests {
             detection_max_scan_seconds: 0.0,
             ..SecurityConfig::default()
         };
-        let (status, _) = config_status_and_body(&spent, benign_request("203.0.113.9")).await;
+        // (Below the validated range, so the unvalidated wiring seam builds it.)
+        let wiring = crate::Wiring::build_unvalidated(&spent, &crate::WiringOptions::default())
+            .expect("wired");
+        let layer = GuardLayer::from_wiring(wiring);
+        let (status, _) = status_and_body(&layer, benign_request("203.0.113.9")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
@@ -5736,5 +5854,395 @@ mod tests {
             .expect("request");
         let (blocked, _) = status_and_body(&layer, get).await;
         assert_eq!(blocked, StatusCode::BAD_REQUEST);
+    }
+
+    // --- reference parity: usage rules order, live rules, strict routes,
+    // body timeout, config validation ---
+
+    fn usage_route() -> RouteConfig {
+        RouteConfig {
+            behavior_rules: vec![guard_core_engine::behavior::BehaviorRule {
+                rule_type: String::from("usage"),
+                threshold: 2,
+                window: 60,
+                pattern: String::new(),
+                action: String::from("ban"),
+                ban_duration: Some(3600),
+                correlate_with_detection: false,
+            }],
+            ..RouteConfig::default()
+        }
+    }
+
+    fn usage_processor() -> guard_core_rs::process_response::ResponseProcessor {
+        guard_core_rs::process_response::ResponseProcessor::new(
+            None,
+            None,
+            Vec::new(),
+            Arc::new(Mutex::new(
+                guard_core_engine::behavior::BehaviorTracker::new(),
+            )),
+            IpBanManager::new(),
+            true,
+            262_144,
+            false,
+        )
+    }
+
+    #[tokio::test]
+    async fn usage_rules_run_after_the_pipeline_so_a_blocked_request_is_not_counted() {
+        let layer = GuardLayer::new(default_config())
+            .with_response_processor(usage_processor())
+            .with_route_configs(resolver_for(&[("GET", "/api")], usage_route()));
+        // Three attack requests the pipeline blocks: the reference never
+        // reaches `process_usage_rules` for them.
+        for _ in 0..3 {
+            let (status, _) =
+                status_and_body(&layer, attack_request_at("/api", "192.0.2.81")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        // The first request that passes the pipeline is the first observation
+        // (threshold 2): it forwards instead of drawing the ban.
+        let (status, body) = status_and_body(&layer, request_at("/api", "192.0.2.81")).await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "gate=off"));
+    }
+
+    #[tokio::test]
+    async fn usage_rules_skip_an_unattributed_request() {
+        let layer = GuardLayer::new(default_config())
+            .with_response_processor(usage_processor())
+            .with_route_configs(resolver_for(&[("GET", "/api")], usage_route()));
+        for _ in 0..4 {
+            let request = Request::builder()
+                .uri("/api")
+                .body(Full::new(Bytes::new()))
+                .expect("request");
+            let (status, _) = status_and_body(&layer, request).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+    }
+
+    fn live_layer(
+        change: impl FnOnce(&mut guard_core_engine::security_config::SecurityConfig),
+    ) -> (
+        GuardLayer,
+        Arc<std::sync::RwLock<guard_core_engine::security_config::SecurityConfig>>,
+    ) {
+        let mut config = guard_core_engine::security_config::SecurityConfig {
+            enable_redis: false,
+            geo_ip_handler: Some(Arc::new(UnitedStates)),
+            ..guard_core_engine::security_config::SecurityConfig::default()
+        };
+        change(&mut config);
+        let wiring = crate::Wiring::from_security_config(&config).expect("wired");
+        let live = Arc::clone(&wiring.live_config);
+        (GuardLayer::from_wiring(wiring), live)
+    }
+
+    fn rule(
+        live: &Arc<std::sync::RwLock<guard_core_engine::security_config::SecurityConfig>>,
+        change: impl FnOnce(&mut guard_core_engine::security_config::SecurityConfig),
+    ) {
+        change(&mut live.write().expect("live config"));
+    }
+
+    #[tokio::test]
+    async fn a_dynamic_rate_limit_rule_changes_the_live_limit_and_keeps_the_windows() {
+        let (layer, live) = live_layer(|config| {
+            config.enable_rate_limiting = true;
+            config.rate_limit = 2;
+            config.rate_limit_window = 60;
+        });
+        for _ in 0..2 {
+            let (status, _) = status_and_body(&layer, request_at("/a", "192.0.2.91")).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (status, _) = status_and_body(&layer, request_at("/a", "192.0.2.91")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        // A rule raises the limit: the recorded window carries over, so the
+        // next request fits under the new ceiling.
+        rule(&live, |config| config.rate_limit = 100);
+        let (status, _) = status_and_body(&layer, request_at("/a", "192.0.2.91")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A rule that switches the limiter off stops the 429s.
+        rule(&live, |config| {
+            config.rate_limit = 1;
+            config.enable_rate_limiting = false;
+        });
+        let (status, _) = status_and_body(&layer, request_at("/a", "192.0.2.91")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn dynamic_country_agent_emergency_and_detection_rules_take_effect() {
+        let (layer, live) = live_layer(|_| {});
+        let (status, _) = status_and_body(&layer, request_at("/a", "192.0.2.92")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A country blocklist (the handler resolves every address to US).
+        rule(&live, |config| {
+            config.blocked_countries = std::collections::BTreeSet::from(["US".to_owned()]);
+        });
+        let (status, _) = status_and_body(&layer, request_at("/a", "192.0.2.92")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        rule(&live, |config| config.blocked_countries.clear());
+
+        // A blocked user agent.
+        rule(&live, |config| {
+            config.blocked_user_agents = vec!["badbot".to_owned()];
+        });
+        let request = Request::builder()
+            .uri("/a")
+            .header("user-agent", "badbot/1.0")
+            .extension(gate_ip("192.0.2.92"))
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let (status, _) = status_and_body(&layer, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        rule(&live, |config| config.blocked_user_agents.clear());
+
+        // Emergency mode locks everyone out.
+        rule(&live, |config| config.emergency_mode = true);
+        let (status, _) = status_and_body(&layer, request_at("/a", "192.0.2.92")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        rule(&live, |config| config.emergency_mode = false);
+
+        // The detection toggle: the attack passes once scanning is off.
+        let (status, _) = status_and_body(&layer, attack_request_at("/a", "192.0.2.92")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        rule(&live, |config| config.enable_penetration_detection = false);
+        let (status, _) = status_and_body(&layer, attack_request_at("/a", "192.0.2.92")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_dynamic_cloud_provider_rule_builds_the_stage() {
+        let (layer, live) = live_layer(|_| {});
+        rule(&live, |config| {
+            config.block_cloud_providers =
+                Some(std::collections::BTreeSet::from(["AWS".to_owned()]));
+        });
+        // The range table is empty until a refresh fills it, so nothing
+        // blocks, but the request still runs through the rebuilt stage.
+        let (status, _) = status_and_body(&layer, request_at("/a", "192.0.2.93")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_strict_route_resolution_answers_an_unresolved_request() {
+        let strict = GuardLayer::new(default_config()).with_route_resolution_strict(true);
+        let mut unresolved = request_at("/nowhere", "192.0.2.61");
+        unresolved
+            .extensions_mut()
+            .insert(crate::GuardRouteUnresolved);
+        let (status, body) = status_and_body(&strict, unresolved).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::INTERNAL_SERVER_ERROR, "Route resolution failed")
+        );
+
+        // The enforced answer emits the event too.
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let bus = guard_core_rs::events::SecurityEventBus::new(true).on_event(Arc::new(
+            move |event: &guard_core_rs::events::SecurityEvent| {
+                sink.lock()
+                    .expect("sink")
+                    .push(format!("{}:{}", event.event_type, event.action_taken));
+            },
+        ));
+        let eventful = GuardLayer::new(default_config())
+            .with_event_bus(Arc::new(bus))
+            .with_route_resolution_strict(true);
+        let mut unresolved = request_at("/nowhere", "192.0.2.61");
+        unresolved
+            .extensions_mut()
+            .insert(crate::GuardRouteUnresolved);
+        let (status, _) = status_and_body(&eventful, unresolved).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            events.lock().expect("sink").as_slice(),
+            ["route_unresolved:request_blocked"]
+        );
+
+        // A resolved request passes, strict or not.
+        let (status, _) = status_and_body(&strict, request_at("/here", "192.0.2.61")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Without strict mode the marker is inert.
+        let lax = GuardLayer::new(default_config());
+        let mut unresolved = request_at("/nowhere", "192.0.2.61");
+        unresolved
+            .extensions_mut()
+            .insert(crate::GuardRouteUnresolved);
+        let (status, _) = status_and_body(&lax, unresolved).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_strict_route_resolution_is_log_only_under_passive_mode_and_emits_the_event() {
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let bus = guard_core_rs::events::SecurityEventBus::new(true).on_event(Arc::new(
+            move |event: &guard_core_rs::events::SecurityEvent| {
+                sink.lock()
+                    .expect("sink")
+                    .push(format!("{}:{}", event.event_type, event.action_taken));
+            },
+        ));
+        let passive = GuardLayer::new(default_config())
+            .with_passive_mode(true)
+            .with_event_bus(Arc::new(bus))
+            .with_route_resolution_strict(true);
+        let mut unresolved = request_at("/nowhere", "192.0.2.62");
+        unresolved
+            .extensions_mut()
+            .insert(crate::GuardRouteUnresolved);
+        let (status, _) = status_and_body(&passive, unresolved).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            events.lock().expect("sink").as_slice(),
+            ["route_unresolved:logged_only"]
+        );
+    }
+
+    /// A scripted upload: `stall` never delivers a frame, otherwise it
+    /// answers pending `pending_polls` times (waking itself) and ends.
+    #[derive(Debug)]
+    struct UploadBody {
+        stall: bool,
+        pending_polls: u8,
+    }
+
+    impl From<Bytes> for UploadBody {
+        fn from(_bytes: Bytes) -> Self {
+            Self {
+                stall: false,
+                pending_polls: 0,
+            }
+        }
+    }
+
+    impl http_body::Body for UploadBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
+            if self.stall {
+                return Poll::Pending;
+            }
+            if self.pending_polls > 0 {
+                self.pending_polls -= 1;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            Poll::Ready(None)
+        }
+    }
+
+    fn upload(body: UploadBody) -> Request<UploadBody> {
+        Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .extension(gate_ip("192.0.2.63"))
+            .body(body)
+            .expect("request")
+    }
+
+    fn upload_service(
+        layer: &GuardLayer,
+    ) -> impl Service<
+        Request<UploadBody>,
+        Response = http::Response<crate::GuardBody<Full<Bytes>>>,
+        Error = Infallible,
+    > {
+        layer.layer(tower::service_fn(|_request: Request<UploadBody>| async {
+            Ok::<_, Infallible>(http::Response::new(Full::new(Bytes::new())))
+        }))
+    }
+
+    fn ready_timer() -> crate::SleepFn {
+        Arc::new(|_| Box::pin(std::future::ready(())))
+    }
+
+    #[tokio::test]
+    async fn a_stalled_body_is_answered_408_once_the_timer_fires() {
+        let layer = GuardLayer::new(default_config())
+            .with_body_read_timeout(std::time::Duration::from_millis(5))
+            .with_body_timer(ready_timer());
+        let stalled = UploadBody {
+            stall: true,
+            pending_polls: 0,
+        };
+        let response = upload_service(&layer)
+            .oneshot(upload(stalled))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert_eq!(&bytes[..], b"Request body read timed out");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_arrives_in_time_is_forwarded_whole() {
+        let layer = GuardLayer::new(default_config())
+            .with_body_read_timeout(std::time::Duration::from_secs(3))
+            .with_body_timer(Arc::new(|_| Box::pin(std::future::pending())));
+        // The read pends twice (the timer pends too), then completes.
+        let slow = UploadBody {
+            stall: false,
+            pending_polls: 2,
+        };
+        let response = upload_service(&layer)
+            .oneshot(upload(slow))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn the_config_supplies_the_body_timeout_and_the_host_supplies_the_timer() {
+        let config = guard_core_engine::security_config::SecurityConfig {
+            enable_redis: false,
+            body_read_timeout: 7.0,
+            ..guard_core_engine::security_config::SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config).expect("layer");
+        assert!(layer.body_read_bound().is_none(), "no timer, no bound");
+        let layer = layer.with_body_timer(ready_timer());
+        assert_eq!(
+            layer.body_read_bound().map(|(timeout, _)| timeout),
+            Some(std::time::Duration::from_secs(7))
+        );
+        assert_eq!(
+            layer.route_resolution_strict(),
+            config.route_resolution_strict
+        );
+    }
+
+    #[test]
+    fn the_config_is_validated_at_construction() {
+        let config = guard_core_engine::security_config::SecurityConfig {
+            enable_redis: false,
+            auto_ban_threshold: 0,
+            ..guard_core_engine::security_config::SecurityConfig::default()
+        };
+        let error = GuardLayer::from_security_config(&config).expect_err("rejected");
+        assert!(matches!(error, crate::GuardConfigError::Config(_)));
+        assert!(error.to_string().contains("auto_ban_threshold"), "{error}");
+        assert!(std::error::Error::source(&error).is_some());
+        let agent = crate::GuardConfigError::Agent("no runtime".to_owned());
+        assert_eq!(agent.to_string(), "agent: no runtime");
+        assert!(std::error::Error::source(&agent).is_none());
     }
 }

@@ -184,6 +184,8 @@
 //!
 //! [`axum-guard-rs`]: https://github.com/Guard-Core/axum-guard-rs
 
+#[cfg(feature = "agent")]
+mod agent;
 mod body;
 mod response;
 mod service;
@@ -245,6 +247,7 @@ pub use guard_core_rs::headers_auth::{
 pub use guard_core_rs::https_enforcement::{
     HttpsEnforcementStage, HttpsRedirectAnswer as HttpsRedirect,
 };
+pub use guard_core_rs::live::{LiveCell, LiveContext, LiveStages};
 pub use guard_core_rs::metrics::{MetricsCollector, SecurityMetric};
 pub use guard_core_rs::process_response::ResponseProcessor;
 pub use guard_core_rs::request_logging::{RequestLoggingStage, RequestLoggingStageConfig};
@@ -280,6 +283,12 @@ pub enum GuardConfigError {
     /// Country rules without a `geo_ip_handler` or an `ipinfo_token`, or the
     /// `GeoIP` database lifecycle refused the config.
     Geo(String),
+    /// [`SecurityConfig::validate`] rejected the config (the reference
+    /// validates at construction).
+    Config(SecurityConfigError),
+    /// `enable_agent` with `agent_strict` and the agent could not be built
+    /// from the `agent_*` fields (the `agent` feature).
+    Agent(String),
 }
 
 impl std::fmt::Display for GuardConfigError {
@@ -292,6 +301,8 @@ impl std::fmt::Display for GuardConfigError {
             Self::Cloud(error) => write!(f, "block_cloud_providers: {error}"),
             Self::Redis(message) => write!(f, "redis: {message}"),
             Self::Geo(message) => write!(f, "geo: {message}"),
+            Self::Config(error) => write!(f, "config: {}", error.problems.join("; ")),
+            Self::Agent(message) => write!(f, "agent: {message}"),
         }
     }
 }
@@ -304,7 +315,8 @@ impl std::error::Error for GuardConfigError {
             Self::UserAgent(error) => Some(error),
             Self::Ban(error) => Some(error),
             Self::Cloud(error) => Some(error),
-            Self::Redis(_) | Self::Geo(_) => None,
+            Self::Config(error) => Some(error),
+            Self::Redis(_) | Self::Geo(_) | Self::Agent(_) => None,
         }
     }
 }
@@ -343,6 +355,7 @@ impl From<WiringError> for GuardConfigError {
             WiringError::Cloud(error) => Self::Cloud(error),
             WiringError::Redis(message) => Self::Redis(message),
             WiringError::Geo(message) => Self::Geo(message),
+            WiringError::Config(error) => Self::Config(error),
         }
     }
 }
@@ -373,6 +386,32 @@ pub struct GuardClientIp(pub IpAddr);
 /// skipped. The downstream service can read it to tell the two apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GuardExclusionScoped;
+
+/// The marker extension a host (or a framework glue layer such as
+/// `axum-guard-rs`) inserts on a request the framework could not resolve to
+/// a route (the reference `request.state.guard_route_unresolved`). With
+/// `route_resolution_strict` set the guard answers it `500 Route resolution
+/// failed` (a logged event under `passive_mode`); without it the marker is
+/// inert and the request runs the pipeline with no per-route config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GuardRouteUnresolved;
+
+/// A timer the layer races the request-body read against: given the
+/// `body_read_timeout`, a future that completes when it elapses. The layer
+/// owns no runtime, so the host supplies one (for example
+/// `|duration| Box::pin(tokio::time::sleep(duration))`).
+pub type SleepFn = Arc<
+    dyn Fn(std::time::Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// What the live config rebuilds for this layer: the engine stages a dynamic
+/// rule can change plus the rate-limit stage built over them.
+pub(crate) struct TowerLive {
+    pub(crate) stages: Arc<LiveStages>,
+    pub(crate) rate_stage: RateLimitStage,
+}
 
 /// Reference default detection configuration.
 ///
@@ -463,6 +502,7 @@ impl core::fmt::Debug for BanState {
 /// # let _ = layer;
 /// ```
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct GuardLayer {
     config: DetectConfig,
     body_cap: usize,
@@ -558,6 +598,21 @@ pub struct GuardLayer {
     /// The stage built by [`GuardLayer::layer`](tower::Layer::layer) from
     /// the fields above; `None` until the layer wraps a service.
     stage: Option<Arc<RateLimitStage>>,
+    /// The live-config cell (a layer built from a `SecurityConfig`): the
+    /// stages a dynamic rule can change, rebuilt when a rule lands.
+    live: Option<Arc<LiveCell<TowerLive>>>,
+    /// The cell's value for the request in flight (set per request by
+    /// [`GuardLayer::refresh_live`]; the stage accessors read it first).
+    live_now: Option<Arc<TowerLive>>,
+    /// `route_resolution_strict`.
+    route_resolution_strict: bool,
+    /// `body_read_timeout`, enforced when a timer is installed.
+    body_read_timeout: Option<std::time::Duration>,
+    /// The host's timer the body read races (see [`SleepFn`]).
+    body_timer: Option<SleepFn>,
+    /// The agent init failed and `agent_strict` was off (the reference
+    /// `agent_degraded`).
+    agent_degraded: bool,
     /// The cloud-refresh seam the `refresh_cloud_ip_ranges` maintenance
     /// call drives (the reference `refresh_cloud_ip_ranges`'s handler).
     cloud_refresh: Option<(
@@ -630,6 +685,12 @@ impl GuardLayer {
             penetration_detection_enabled: true,
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
             stage: None,
+            live: None,
+            live_now: None,
+            route_resolution_strict: false,
+            body_read_timeout: None,
+            body_timer: None,
+            agent_degraded: false,
             cloud_refresh: None,
         }
     }
@@ -650,8 +711,12 @@ impl GuardLayer {
 
     /// The global scan toggle (`enable_penetration_detection`, the
     /// reference default `true`).
-    pub(crate) const fn penetration_detection_enabled(&self) -> bool {
-        self.penetration_detection_enabled
+    pub(crate) fn penetration_detection_enabled(&self) -> bool {
+        self.live_now
+            .as_ref()
+            .map_or(self.penetration_detection_enabled, |live| {
+                live.stages.penetration_detection
+            })
     }
 
     /// Set the global scan toggle (`enable_penetration_detection`): the
@@ -711,6 +776,45 @@ impl GuardLayer {
         self.auth_verifier.as_ref()
     }
 
+    /// Set `route_resolution_strict`: a request marked
+    /// [`GuardRouteUnresolved`] is answered `500 Route resolution failed`
+    /// (the reference `RouteConfigCheck`; logged only under `passive_mode`).
+    #[must_use]
+    pub const fn with_route_resolution_strict(mut self, strict: bool) -> Self {
+        self.route_resolution_strict = strict;
+        self
+    }
+
+    pub(crate) const fn route_resolution_strict(&self) -> bool {
+        self.route_resolution_strict
+    }
+
+    /// Set the request-body read bound (the reference `body_read_timeout`).
+    /// A body that does not arrive in full within it is answered `408
+    /// Request body read timed out` instead of being forwarded.
+    /// [`GuardLayer::from_security_config`] installs the config's value; the
+    /// bound is enforced once the host supplies a timer with
+    /// [`GuardLayer::with_body_timer`] (the layer owns no runtime), and the
+    /// read is unbounded without one.
+    #[must_use]
+    pub const fn with_body_read_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.body_read_timeout = Some(timeout);
+        self
+    }
+
+    /// Install the timer the body read races the `body_read_timeout`
+    /// against, for example
+    /// `Arc::new(|duration| Box::pin(tokio::time::sleep(duration)))`.
+    #[must_use]
+    pub fn with_body_timer(mut self, timer: SleepFn) -> Self {
+        self.body_timer = Some(timer);
+        self
+    }
+
+    pub(crate) fn body_read_bound(&self) -> Option<(std::time::Duration, &SleepFn)> {
+        self.body_read_timeout.zip(self.body_timer.as_ref())
+    }
+
     /// Install the telemetry fan-out `agent_stats` reports on.
     #[must_use]
     pub fn with_telemetry(mut self, telemetry: Arc<CompositeAgentHandler>) -> Self {
@@ -755,24 +859,27 @@ impl GuardLayer {
     /// maps every field onto the stage or knob it owns, in one place, with
     /// the reference semantics, and the layer installs each part.
     ///
-    /// The telemetry agent is a collaborator the config cannot carry: use
-    /// [`GuardLayer::from_security_config_with`] to inject one through
+    /// The telemetry agent: with the `agent` feature and `enable_agent` set,
+    /// the layer builds it from the `agent_*` fields (inside a tokio
+    /// runtime); otherwise inject one through
+    /// [`GuardLayer::from_security_config_with`] and
     /// [`WiringOptions::agent`]. Without a sink the event bus, the metrics
     /// collector and the dynamic rules stay off and
     /// [`GuardLayer::agent_stats`] reports `enabled: false`.
     ///
-    /// Fields the wiring documents as living on [`Wiring::config`]
-    /// (`route_resolution_strict`, `body_read_timeout`, `log_format`,
-    /// `custom_log_file`, `lazy_init`): this adapter owns no runtime, so it
-    /// reads none of them. Per-route resolution is the host's resolver, and
-    /// the body is read as the wrapped service's body type delivers it.
+    /// The config is validated first ([`SecurityConfig::validate`], as the
+    /// reference validates at construction). A layer built this way reads the
+    /// stages a dynamic rule can change from the live config on every request.
+    /// `route_resolution_strict` and `body_read_timeout` are installed (see
+    /// [`GuardLayer::with_body_timer`] for the timer the timeout needs);
+    /// `log_format` and `custom_log_file` stay on [`Wiring::config`].
     ///
     /// # Errors
     ///
     /// [`GuardConfigError`] when an engine constructor rejects a value
-    /// (an invalid IP/CIDR list entry, a zero rate-limit knob, a ReDoS-unsafe
-    /// blocked user-agent pattern, an unknown cloud provider, a Redis or geo
-    /// setup the config cannot satisfy).
+    /// (a value the validator rejects, an invalid IP/CIDR list entry, a zero
+    /// rate-limit knob, a ReDoS-unsafe blocked user-agent pattern, an unknown
+    /// cloud provider, a Redis or geo setup the config cannot satisfy).
     pub fn from_security_config(
         config: &guard_core_engine::security_config::SecurityConfig,
     ) -> Result<Self, GuardConfigError> {
@@ -792,15 +899,57 @@ impl GuardLayer {
         config: &guard_core_engine::security_config::SecurityConfig,
         options: &WiringOptions,
     ) -> Result<Self, GuardConfigError> {
+        #[cfg(feature = "agent")]
+        if options.agent.is_none() {
+            // The reference builds the agent from the config
+            // (`config.to_agent_config()`); a failure degrades unless
+            // `agent_strict`.
+            match crate::agent::build(config) {
+                Ok(Some(agent)) => {
+                    let mut options = options.clone();
+                    options.agent = Some(agent);
+                    return Self::wired(config, &options);
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    if let Some(hook) = &config.on_error {
+                        hook("agent_init", &message, &std::collections::BTreeMap::new());
+                    }
+                    if config.agent_strict {
+                        return Err(GuardConfigError::Agent(message));
+                    }
+                    return Ok(Self::wired(config, options)?.with_agent_degraded());
+                }
+            }
+        }
+        Self::wired(config, options)
+    }
+
+    fn wired(
+        config: &guard_core_engine::security_config::SecurityConfig,
+        options: &WiringOptions,
+    ) -> Result<Self, GuardConfigError> {
         Ok(Self::from_wiring(Wiring::from_security_config_with(
             config, options,
         )?))
     }
 
+    #[cfg(feature = "agent")]
+    fn with_agent_degraded(mut self) -> Self {
+        self.agent_degraded = true;
+        self
+    }
+
     /// Install every part of a built [`Wiring`] on a new layer.
     #[must_use]
     pub fn from_wiring(wiring: Wiring) -> Self {
+        let live_context = wiring.live.clone();
         let mut layer = Self::new(wiring.detect)
+            .with_route_resolution_strict(wiring.config.route_resolution_strict)
+            .with_body_read_timeout(
+                std::time::Duration::try_from_secs_f64(wiring.config.body_read_timeout)
+                    .unwrap_or(std::time::Duration::from_secs(3)),
+            )
             .with_passive_mode(wiring.passive_mode)
             .with_penetration_detection(wiring.penetration_detection)
             .with_exclude_paths(wiring.config.exclude_paths.clone())
@@ -877,7 +1026,32 @@ impl GuardLayer {
         if let Some(dynamic_rules) = wiring.dynamic_rules {
             layer = layer.with_dynamic_rules(dynamic_rules);
         }
-        layer
+        layer.install_live(&live_context)
+    }
+
+    /// Install the live-config cell: the rate-limit stage and the stages a
+    /// dynamic rule can change are rebuilt from the live config when a rule
+    /// lands (see `guard_core_rs::live`).
+    fn install_live(mut self, context: &LiveContext) -> Self {
+        let snapshot = self.clone();
+        let counters = self
+            .ban_state
+            .as_ref()
+            .map_or_else(ViolationCounters::new, |state| state.counters.clone());
+        let cell = context.cell(move |stages| TowerLive {
+            stages: Arc::clone(stages),
+            rate_stage: snapshot.build_live_stage(stages, &counters),
+        });
+        if let Ok(cell) = cell {
+            self.live = Some(Arc::new(cell));
+        }
+        self
+    }
+
+    /// Point the layer at the live stages for the request in flight (a
+    /// no-op for a layer built without a config).
+    pub(crate) fn refresh_live(&mut self) {
+        self.live_now = self.live.as_ref().map(|cell| cell.get());
     }
 
     /// Replace the body buffering cap, in bytes.
@@ -1392,10 +1566,11 @@ impl GuardLayer {
     pub fn agent_stats(&self) -> AgentStats {
         AgentStats {
             enabled: self.telemetry.is_some(),
-            degraded: self
-                .telemetry
-                .as_deref()
-                .is_some_and(CompositeAgentHandler::degraded),
+            degraded: self.agent_degraded
+                || self
+                    .telemetry
+                    .as_deref()
+                    .is_some_and(CompositeAgentHandler::degraded),
         }
     }
 
@@ -1466,8 +1641,11 @@ impl GuardLayer {
         &self.custom_error_responses
     }
 
-    pub(crate) const fn emergency_mode(&self) -> Option<&EmergencyModeStage> {
-        self.emergency_mode.as_ref()
+    pub(crate) fn emergency_mode(&self) -> Option<&EmergencyModeStage> {
+        match &self.live_now {
+            Some(live) => live.stages.emergency.as_ref(),
+            None => self.emergency_mode.as_ref(),
+        }
     }
 
     pub(crate) const fn https_enforcement(&self) -> Option<&HttpsEnforcementStage> {
@@ -1494,16 +1672,25 @@ impl GuardLayer {
         self.time_window_gate.as_ref()
     }
 
-    pub(crate) const fn geo_blocking(&self) -> Option<&GeoStage> {
-        self.geo_blocking.as_ref()
+    pub(crate) fn geo_blocking(&self) -> Option<&GeoStage> {
+        match &self.live_now {
+            Some(live) => live.stages.geo.as_ref(),
+            None => self.geo_blocking.as_ref(),
+        }
     }
 
-    pub(crate) const fn cloud_provider(&self) -> Option<&CloudProviderStage> {
-        self.cloud_provider.as_ref()
+    pub(crate) fn cloud_provider(&self) -> Option<&CloudProviderStage> {
+        match &self.live_now {
+            Some(live) => live.stages.cloud.as_ref(),
+            None => self.cloud_provider.as_ref(),
+        }
     }
 
-    pub(crate) const fn user_agent(&self) -> Option<&UserAgentStage> {
-        self.user_agent.as_ref()
+    pub(crate) fn user_agent(&self) -> Option<&UserAgentStage> {
+        match &self.live_now {
+            Some(live) => live.stages.user_agent.as_ref(),
+            None => self.user_agent.as_ref(),
+        }
     }
 
     pub(crate) const fn response_processor(&self) -> Option<&Arc<ResponseProcessor>> {
@@ -1524,7 +1711,10 @@ impl GuardLayer {
     /// [`GuardLayer::layer`](tower::Layer::layer)); every stateful
     /// decision and emission goes through it.
     pub(crate) fn stage(&self) -> Option<&RateLimitStage> {
-        self.stage.as_deref()
+        match &self.live_now {
+            Some(live) => Some(&live.rate_stage),
+            None => self.stage.as_deref(),
+        }
     }
 
     /// Build the engine stage from the configured handles and seams.
@@ -1546,17 +1736,45 @@ impl GuardLayer {
             },
             |state| state.config.clone(),
         );
+        self.stage_over(
+            rate_limit,
+            ip_ban,
+            self.rate_limiter.as_deref().cloned(),
+            self.ban_state
+                .as_ref()
+                .map(|state| (state.manager.clone(), state.counters.clone())),
+        )
+    }
+
+    /// The same stage over the live stages: the limiter and the ban knobs a
+    /// dynamic rule changed, sharing the recorded windows and the ban store.
+    fn build_live_stage(&self, live: &LiveStages, counters: &ViolationCounters) -> RateLimitStage {
+        self.stage_over(
+            live.rate_limit.clone(),
+            live.ip_ban.clone(),
+            Some(live.rate_limiter.clone()),
+            Some((live.bans.clone(), counters.clone())),
+        )
+    }
+
+    fn stage_over(
+        &self,
+        rate_limit: RateLimitConfig,
+        ip_ban: IpBanConfig,
+        limiter: Option<RateLimiter>,
+        bans: Option<(IpBanManager, ViolationCounters)>,
+    ) -> RateLimitStage {
         let mut builder = RateLimitStage::builder(RateLimitStageConfig {
             rate_limit,
             ip_ban,
             passive_mode: self.passive_mode,
             custom_error_responses: self.custom_error_responses.clone(),
         });
-        if let Some(limiter) = &self.rate_limiter {
-            builder = builder.limiter(limiter.as_ref().clone());
+        if let Some(limiter) = limiter {
+            builder = builder.limiter(limiter);
         }
-        if let Some(state) = &self.ban_state {
-            builder = builder.ban_manager(state.manager.clone(), state.counters.clone());
+        if let Some((manager, counters)) = bans {
+            builder = builder.ban_manager(manager, counters);
         }
         if let Some(resolver) = &self.route_tiers {
             {

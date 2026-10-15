@@ -89,7 +89,9 @@ impl TelemetryHandler for Sink {
 
 fn with_sink(config: &SecurityConfig) -> (GuardLayer, Arc<Sink>) {
     let sink = Arc::new(Sink::default());
-    let layer = GuardLayer::from_security_config_with(
+    // The unvalidated seam: the dynamic-rule loop test polls on a one second
+    // interval, below the validated range.
+    let wiring = Wiring::build_unvalidated(
         config,
         &WiringOptions {
             agent: Some(Arc::clone(&sink) as Arc<dyn TelemetryHandler>),
@@ -97,7 +99,7 @@ fn with_sink(config: &SecurityConfig) -> (GuardLayer, Arc<Sink>) {
         },
     )
     .expect("valid config");
-    (layer, sink)
+    (GuardLayer::from_wiring(wiring), sink)
 }
 
 // --- the builder surface ---------------------------------------------------
@@ -199,16 +201,17 @@ fn every_wiring_error_maps_onto_the_config_error() {
         ),
     ];
     for (config, label) in cases {
-        let error = GuardLayer::from_security_config(&config).expect_err(label);
-        assert!(error.to_string().contains(label), "{label}: {error}");
-        let wired: GuardConfigError = Wiring::from_security_config(&config)
+        // The validating constructors refuse every one of them.
+        GuardLayer::from_security_config(&config).expect_err(label);
+        Wiring::from_security_config(&config)
+            .map(|_| ())
+            .expect_err(label);
+        // The stage constructors name the value when validation is skipped.
+        let error: GuardConfigError = Wiring::build_unvalidated(&config, &WiringOptions::default())
             .map(|_| ())
             .expect_err(label)
             .into();
-        assert_eq!(
-            std::mem::discriminant(&wired),
-            std::mem::discriminant(&error)
-        );
+        assert!(error.to_string().contains(label), "{label}: {error}");
         assert_eq!(std::error::Error::source(&error).is_some(), label != "geo");
     }
     let ban: GuardConfigError = WiringError::Ban(tower_guard_rs::IpBanConfigError::NonPositive {
