@@ -18,7 +18,8 @@ name = "tower_guard_rs"
 
 [dependencies]
 bytes = "1.10"
-# guard-core-engine is published to crates.io (4.3.2); the path points at the
+# guard-core-engine is published to crates.io (the version below is the
+# floor this crate needs); the path points at the
 # engine crate inside a sibling guard-core-rs checkout so local builds and CI
 # (see .github/workflows/ci.yml) exercise the engine from source. The version
 # pin stays in lockstep with the published engine release.
