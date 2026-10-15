@@ -1975,6 +1975,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn from_security_config_semantic_header_exclusions_reach_the_engine_config() {
+        let config = SecurityConfig {
+            excluded_semantic_detection_headers: [String::from("Cookie")].into_iter().collect(),
+            enabled_detection_categories: std::collections::BTreeSet::new(),
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        let installed = layer
+            .detection_exclusions()
+            .expect("the semantic header set alone installs the block");
+        assert_eq!(
+            installed.excluded_semantic_detection_headers,
+            vec![String::from("Cookie")]
+        );
+    }
+
+    #[tokio::test]
+    async fn from_security_config_scan_time_budget_reaches_the_scan() {
+        let (status, _) =
+            config_status_and_body(&SecurityConfig::default(), benign_request("203.0.113.9")).await;
+        assert_eq!(status, StatusCode::OK, "the default budget leaves it alone");
+
+        // A spent cap fails closed: the engine's scan answers a threat even
+        // for a benign request.
+        let spent = SecurityConfig {
+            detection_max_scan_seconds: 0.0,
+            ..SecurityConfig::default()
+        };
+        let (status, _) = config_status_and_body(&spent, benign_request("203.0.113.9")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn from_security_config_custom_scan_time_cap_alone_installs_the_block() {
+        let config = SecurityConfig {
+            enabled_detection_categories: std::collections::BTreeSet::new(),
+            detection_max_scan_seconds: 2.5,
+            ..SecurityConfig::default()
+        };
+        let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        let installed = layer.detection_exclusions().expect("the cap installs it");
+        assert_eq!(installed.max_scan_seconds, Some(2.5));
+    }
+
+    #[tokio::test]
     async fn from_security_config_silent_observability_skips_the_knob() {
         let config = SecurityConfig {
             log_suspicious_level: None,
