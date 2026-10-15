@@ -196,7 +196,8 @@ pub use guard_core_engine::ip_ban::{
 pub use guard_core_engine::ip_gate::{
     IpGateConfig, IpGateDecision, IpGateDenial, IpGateError, IpGateVerdict,
 };
-pub use guard_core_engine::payload::{OnErrorFn, ResponseModifierFn};
+pub use guard_core_engine::custom_checks::{CustomRequestContext, CustomRequestFn, CustomResponse};
+pub use guard_core_engine::payload::{OnErrorFn, RequestBits, ResponseBits, ResponseModifierFn};
 pub use guard_core_engine::rate_limit::{
     RateLimitConfig, RateLimitConfigError, RateLimitDecision, RateLimitEntry, RateLimitTier,
     RateLimiter, RouteRateLimits, TierDecision,
@@ -218,7 +219,7 @@ pub use guard_core_rs::headers_auth::{
 pub use guard_core_rs::https_enforcement::{
     HttpsEnforcementStage, HttpsRedirectAnswer as HttpsRedirect,
 };
-pub use guard_core_rs::metrics::MetricsCollector;
+pub use guard_core_rs::metrics::{MetricsCollector, SecurityMetric};
 pub use guard_core_rs::process_response::ResponseProcessor;
 pub use guard_core_rs::request_logging::{RequestLoggingStage, RequestLoggingStageConfig};
 pub use guard_core_rs::responses::{BlockPayload, CustomErrorResponses, OnBlockHook};
