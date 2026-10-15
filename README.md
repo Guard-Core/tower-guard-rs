@@ -188,11 +188,20 @@ Every stateful decision and emission runs through the engine facade's rate-limit
 | Rate-limit tiers | `.with_route_tiers(resolver)` (`path -> Option<RouteRateLimits>`; a `RouteRateLimits` request extension wins), `.with_geo_handler(handler)` (geo tiers) |
 | Detection exclusions | `.with_detection_exclusions(config)` (global `excluded_detection_headers/params/body_fields`, `enabled_detection_categories`, `detection_scan_body`); per route via a `RouteDetectionExclusions` request extension (a non-`None` route value replaces the global set; headers always merge) |
 | Events + log settings | `.with_event_bus(bus)` (`SecurityEventBus` hook registration), `.with_observability(config)` (`log_suspicious_level`, `muted_check_logs`, the `log_sensitive_headers/params/body_fields` redaction sets) |
+| Client policy | `.with_client_policy(ClientPolicy { trusted_proxies, trusted_proxy_depth, fail_secure })` (builder layers default to no trusted proxies and `fail_secure = false`; `from_security_config` installs the config's policy) |
 | `on_block` + custom errors | `.with_on_block(hook)`, `.with_custom_error_responses(map)` (status-to-body overrides on every block answer, including the `400` detection block) |
 | Distributed mode | `.with_distributed_store(window_store, prefix, fail_open)` + `.with_distributed_ban_store(ban_store)` (fail-closed backend errors answer `503 Redis rate limiting unavailable`) |
 | Passive mode | `.with_passive_mode(true)` (windows and counters still record, log lines and events still fire, no `400`/`403`/`429` renders, auto-ban feeds suppressed) |
 
 Scan notes: the query string is scanned as `parse_qsl`-decoded per-parameter pairs (what makes `excluded_detection_params` functional), and excluded headers scan with their known false-positive categories suppressed (`ssrf` for address-chain values) instead of a blanket skip.
+
+## Config, client resolution and exclusions
+
+`GuardLayer::from_security_config(&config)` builds the whole pipeline from a `SecurityConfig` through the engine facade's `Wiring`, so every field with an engine-side consumer lands on its stage (the facade's `wiring` module documents the field-by-field table). `from_security_config_with(&config, &WiringOptions { agent, logfire_client })` also injects the telemetry agent: any `TelemetryHandler`, for example guard-agent-rs's `GuardAgentTelemetry` built from the `agent_*` fields. With a sink the event bus, the request metrics and `agent_stats()` (`enabled`, `degraded`) are live, and `spawn_dynamic_rules()` starts the dynamic-rule poll loop on a std thread (host-started, drop the handle to stop it). Redis-backed rate limits and bans need the facade's `redis` feature (enabled through your own `guard-core-rs` dependency) or `with_distributed_store`. `route_resolution_strict`, `body_read_timeout`, `log_format` and `custom_log_file` stay on `Wiring::config`: this adapter has no runtime and reads none of them.
+
+The connecting peer is the `GuardClientIp` request extension. It is resolved through the client policy (trusted proxies, depth, `X-Forwarded-For`, IPv4-mapped canonicalization) and the resolved client feeds the IP gate, bans, rate limits, geo, cloud, events and the response pass. A request with no peer that cannot be resolved answers `403 Client address could not be determined` under `fail_secure` (the `from_security_config` default), after firing `on_block` with the `client_address_unresolved` check; with `fail_secure = false` it continues unattributed. The HTTPS stage trusts `X-Forwarded-Proto` only from a trusted connecting peer.
+
+`exclude_paths` matches a path or anything under it on a `/` boundary (`/static` excludes `/static/app.js`, never `/staticx`) after percent-decoding and dot-collapsing. An excluded request runs the reference scoped pipeline: route resolution, bans, the global IP, country and cloud rules and the rate limit still apply; detection, emergency mode, HTTPS enforcement, headers, validators, the user-agent filter and custom checks are skipped. Its response gets metrics, security headers, CORS and the modifier (no return rules), and the request carries the `GuardExclusionScoped` extension. A route bypassing `"all"` checks is forwarded as is, with only the response modifier applied (the `security_bypass` event fires when a bus is installed). The response modifier runs with or without a `ResponseProcessor`, and return rules see the response body when the processor asks for it (the whole body is buffered and re-emitted, trailers are dropped).
 
 ## Responses
 
@@ -206,6 +215,7 @@ Scan notes: the query string is scanned as `parse_qsl`-decoded per-parameter pai
 | Engine flags a view and a crossed auto-ban threshold bans on the spot | `403 Forbidden` | `IP has been banned` |
 | Body exceeds the cap | `413 Payload Too Large` | `Payload too large` |
 | Body read error or engine panic | `500 Internal Server Error` | `Security check failed` |
+| No resolvable client address under `fail_secure` | `403 Forbidden` | `Client address could not be determined` |
 
 The bodies follow the ecosystem's plain-text error convention (the bare message, `text/plain; charset=utf-8`, same as the Python family), but the adapter is deliberately **fail-secure**: unlike the TypeScript adapters, whose check pipeline logs and skips on error, any failure to complete the security check answers `500`, never an uninspected passthrough.
 
@@ -224,7 +234,7 @@ A body larger than the cap is rejected with `413` rather than forwarded unscanne
 
 ## Status route
 
-`status::GuardStatusService::new(GuardStatus::new().with_cloud_table(table))` is the `add_status_route` mirror (fastapi-guard `guard/status.py` + `HandlerInitializer.get_initialization_status`): a plain tower service answering every request with the initialization snapshot, so the host framework routes it wherever the family default `/_guard/status` (`status::DEFAULT_STATUS_PATH`) belongs. The payload carries the cloud-provider status table (`{"ready":..., "last_refreshed":<unix-seconds|null>, "entries":N}` per provider from the live `CloudIpTable`) and the geo-ip component (`null` without a handler, `{"configured":true}` with the lookup trait only, the `{ready, last_refreshed, entries}` health snapshot with the `IpInfoManager` lifecycle manager). The maintenance trio lives on `GuardLayer`/`GuardService`: `reset()` drops the rate-limit windows, `refresh_cloud_ip_ranges()` schedules one single-flight refresh through `with_cloud_refresh_scheduler` (the refreshed ranges land in the shared table), and `agent_stats()` answers the reference property's no-agent shape. axum applications get the mounted route through `axum-guard-rs`'s `status::status_router`.
+`status::GuardStatusService::new(GuardStatus::new().with_cloud_table(table))` is the `add_status_route` mirror (fastapi-guard `guard/status.py` + `HandlerInitializer.get_initialization_status`): a plain tower service answering every request with the initialization snapshot, so the host framework routes it wherever the family default `/_guard/status` (`status::DEFAULT_STATUS_PATH`) belongs. The payload carries the cloud-provider status table (`{"ready":..., "last_refreshed":<unix-seconds|null>, "entries":N}` per provider from the live `CloudIpTable`) and the geo-ip component (`null` without a handler, `{"configured":true}` with the lookup trait only, the `{ready, last_refreshed, entries}` health snapshot with the `IpInfoManager` lifecycle manager). The maintenance trio lives on `GuardLayer`/`GuardService`: `reset()` drops the rate-limit windows, `refresh_cloud_ip_ranges()` schedules one single-flight refresh through `with_cloud_refresh_scheduler` (the refreshed ranges land in the shared table), and `agent_stats()` reports whether a telemetry sink is wired and whether it started degraded. axum applications get the mounted route through `axum-guard-rs`'s `status::status_router`.
 
 ## WebSocket upgrades
 
@@ -232,9 +242,9 @@ WebSocket upgrades are not guarded by this adapter. A tower service sees the upg
 
 ## Engine dependency
 
-The Cargo.toml pins `guard-core-engine` and `guard-core-rs` at 4.2.0 and carries paths pointing at the sibling `guard-core-rs` checkout (`../guard-core-rs/crates/guard-core-engine`, `../guard-core-rs/crates/guard-core-rs`) so local builds and CI compile the engine from source. Registry note, stated plainly: the 4.1.0 dists were yanked (the version-accuracy fix for the family tag mistake), so the 1.1.0 of this crate could not resolve its engine from the registry alone; the synchronized 4.2.0 train restores resolution (`tower-guard-rs` 1.2.0 over `guard-core-engine`/`guard-core-rs` 4.2.0). CI checks out `Guard-Core/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `laravel-guard`/`symfony-guard`.
+The Cargo.toml requires `guard-core-engine` and `guard-core-rs` at 4.3.2 or newer and carries paths pointing at the sibling `guard-core-rs` checkout (`../guard-core-rs/crates/guard-core-engine`, `../guard-core-rs/crates/guard-core-rs`) so local builds and CI compile the engine from source. Registry note, stated plainly: the 4.1.0 dists were yanked (the version-accuracy fix for the family tag mistake), so the 1.1.0 of this crate could not resolve its engine from the registry alone; the synchronized 4.2.0 train restores resolution (`tower-guard-rs` 1.2.0 over `guard-core-engine`/`guard-core-rs` 4.2.0). CI checks out `Guard-Core/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `laravel-guard`/`symfony-guard`.
 
-The adapter now depends on both halves of the sibling checkout: the `guard-core-engine` crate (detection, rate limiting, bans, exclusions, geo, distributed traits) and the `guard-core-rs` facade (the event bus, the log/redaction port, the `on_block`/custom-error contract, and the rate-limit stage the layer delegates to), both pinned at 4.2.0 with path fallbacks into `../guard-core-rs`.
+The adapter now depends on both halves of the sibling checkout: the `guard-core-engine` crate (detection, rate limiting, bans, exclusions, geo, distributed traits) and the `guard-core-rs` facade (the event bus, the log/redaction port, the `on_block`/custom-error contract, and the rate-limit stage the layer delegates to), both with a 4.3.2 floor and path fallbacks into `../guard-core-rs`.
 
 ## Stage surface (the reference 17-check pipeline, wired)
 
@@ -242,8 +252,7 @@ Every reference check the engine ships is installable on `GuardLayer`, and `Guar
 
 ## Not wired on purpose
 
-- **WebSocket guard**: a tower service sees a WebSocket upgrade as an ordinary request, so the handshake is screened like any request; frames after the upgrade are not intercepted. There is no per-frame guard surface.
-- **Status route**: no `add_status_route` equivalent ships (a gap tracked family-wide); expose engine state through your own route if you need it.
+- **WebSocket frame guard**: a tower service sees a WebSocket upgrade as an ordinary request, so the handshake is screened like any request, but the upgrade completes at the hyper connection level and frames after it are not intercepted. There is no per-frame surface here; see the WebSocket section above for where the guard exists.
 
 ## Development
 

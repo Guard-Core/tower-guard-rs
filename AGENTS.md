@@ -8,8 +8,8 @@ tower-guard-rs is the framework-agnostic Rust adapter for the Guard ecosystem: a
 - **Repository**: https://github.com/Guard-Core/tower-guard-rs
 - **Language**: Rust, edition 2024, MSRV 1.92
 - **License**: MIT OR Apache-2.0
-- **Version**: 0.1.0
-- **Status**: implemented and tested. Not published to crates.io: the engine is a local path dependency until it is tagged (see [Engine Dependency](#engine-dependency)).
+- **Version**: 1.5.0 (see `Cargo.toml`)
+- **Status**: implemented and tested. The engine crates are published; this repo builds them from a sibling checkout through path dependencies that also carry a registry version floor (see [Engine Dependency](#engine-dependency)).
 
 ## Ecosystem Position
 
