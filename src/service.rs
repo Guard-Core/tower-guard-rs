@@ -78,10 +78,10 @@ impl<S> GuardService<S> {
         self.layer.refresh_cloud_ip_ranges()
     }
 
-    /// The reference `agent_stats` in its no-agent shape
+    /// The reference `agent_stats`
     /// ([`GuardLayer::agent_stats`]).
     #[must_use]
-    pub const fn agent_stats(&self) -> crate::AgentStats {
+    pub fn agent_stats(&self) -> crate::AgentStats {
         self.layer.agent_stats()
     }
 }
@@ -151,14 +151,11 @@ where
         Box::pin(async move {
             let started = Instant::now();
             let (mut parts, mut body) = request.into_parts();
-            let facts = RequestFacts::extract(&parts);
-
-            // The reference `exclude_paths` carve-out runs first: the
-            // docs/static paths bypass the whole pipeline (exact path
-            // match), detection included.
-            if layer.exclude_paths.contains(&facts.path) {
-                return forward(&layer, &facts, parts, None, None, inner).await;
-            }
+            // The reference client resolution: the connecting peer (the
+            // `GuardClientIp` extension) through the trusted-proxy policy
+            // replaces the identity everywhere downstream.
+            let (unresolved, peer) = resolve_client(&layer, &mut parts);
+            let mut facts = RequestFacts::extract(&parts);
 
             // The reference's CORS preflight short-circuit: an OPTIONS
             // request carrying `access-control-request-method` answers from
@@ -176,6 +173,18 @@ where
                 return Ok(answer);
             }
 
+            // The reference `handle_passthrough`: a path matching
+            // `exclude_paths` is marked scoped and continues (only route
+            // resolution, bans, the global IP/country/cloud rules and the
+            // rate limit still run for it); any other request with no
+            // resolvable client address is rejected under `fail_secure`.
+            let scoped = layer.is_excluded(&facts.path);
+            if scoped {
+                parts.extensions.insert(crate::GuardExclusionScoped);
+            } else if unresolved {
+                return Ok(unresolved_client_response(&parts, &layer));
+            }
+
             // The reference `RouteConfigResolver`: the carrier extension
             // wins over the installed resolver (the app attaches the
             // route's config directly, the reference
@@ -191,6 +200,18 @@ where
                 });
             let route = route_carrier.as_deref();
 
+            // The reference `handle_security_bypass`: a route that bypasses
+            // "all" checks is forwarded to the real downstream service and
+            // only the response modifier runs (no checks, no metrics, no
+            // headers, no return rules). Passive mode keeps the request in
+            // the pipeline (the event still fires).
+            if route.is_some_and(|route| route.bypassed_checks.contains("all")) {
+                emit_security_bypass_event(&layer, &facts, route.expect("checked above"));
+                if !layer.passive_mode {
+                    return forward_bypassed(&layer, &facts, parts, body, inner).await;
+                }
+            }
+
             // The reference `process_usage_rules`: the route's usage and
             // frequency behavior rules track the request observation and a
             // crossed threshold dispatches the rule's action (a `ban`
@@ -200,7 +221,8 @@ where
             // request pass).
             let route_rules: &[guard_core_engine::behavior::BehaviorRule] =
                 route.map_or(&[], |route| &route.behavior_rules);
-            if !route_rules.is_empty()
+            if !scoped
+                && !route_rules.is_empty()
                 && let Some(processor) = layer.response_processor()
             {
                 let endpoint_id = format!("{}:{}", facts.method, facts.path);
@@ -230,6 +252,72 @@ where
                     route.bypassed_checks.contains("all") || route.bypassed_checks.contains(check)
                 })
             };
+
+            // The scoped pipeline of an `exclude_paths` request (the
+            // reference `enforced_on_excluded_paths` checks: route_config,
+            // ip_security, rate_limit): the ban arm, the GLOBAL IP/country/
+            // cloud rules only (no route restrictions, no auto-ban
+            // escalation, no route-level "ip" bypass), then the rate-limit
+            // tiers without a detection finding. Everything else (detection,
+            // emergency, HTTPS, logging, body, headers/auth, referrer,
+            // validators, time window, user agent, custom request) is
+            // skipped.
+            if scoped {
+                let stage = layer
+                    .stage()
+                    .expect("the stage is built by GuardLayer::layer");
+                let observation = request_observation(&parts);
+                if !bypassed("ip_ban")
+                    && let Some(blocked) = stage.decide_bans_observed(facts.ip, Some(&observation))
+                {
+                    return Ok(finish_generated(&parts, &layer, response::stage(&blocked)));
+                }
+                if let Some(denial) = enforce_ip_gate(&mut parts, &layer) {
+                    return Ok(finish_generated(&parts, &layer, denial));
+                }
+                facts.gate = parts.extensions.get::<IpGateDecision>().copied();
+                if let Some(stage) = layer.geo_blocking()
+                    && let Some(decision) = stage.decide(facts.ip, facts.gate)
+                {
+                    return Ok(block_response(
+                        &parts,
+                        &layer,
+                        decision.answer.status.as_u16(),
+                        stage_answer_body(&decision.answer),
+                    ));
+                }
+                if let Some(stage) = layer.cloud_provider()
+                    && let Some(decision) = stage.decide(facts.ip, facts.gate)
+                {
+                    return Ok(block_response(
+                        &parts,
+                        &layer,
+                        decision.answer.status.as_u16(),
+                        stage_answer_body(&decision.answer),
+                    ));
+                }
+                let carrier_tiers = match route.map(RouteConfig::rate_limits) {
+                    Some(Ok(tiers)) => tiers,
+                    Some(Err(_)) => return Ok(failure_response(&parts, &layer)),
+                    None => None,
+                };
+                let route_tiers = carrier_tiers
+                    .as_ref()
+                    .or_else(|| parts.extensions.get::<RouteRateLimits>());
+                if !bypassed("rate_limit")
+                    && let Some(blocked) = stage.decide_tiers_observed(
+                        facts.ip,
+                        Some(&facts.path),
+                        route_tiers,
+                        facts.gate,
+                        None,
+                        Some(&observation),
+                    )
+                {
+                    return Ok(finish_generated(&parts, &layer, response::stage(&blocked)));
+                }
+                return forward(&layer, &facts, parts, body, started, inner, true).await;
+            }
 
             // The reference `_check_route_ip_access` (inside the
             // `ip_security` block, before the global lists): the route's
@@ -312,6 +400,9 @@ where
             {
                 return Ok(finish_generated(&parts, &layer, denial));
             }
+            // The gate's skip state (whitelisted / exempt) is only known now:
+            // the geo, cloud and user-agent stages below read it.
+            facts.gate = parts.extensions.get::<IpGateDecision>().copied();
 
             // Check 2: emergency mode (503 outside the whitelist). The
             // reference pipeline never consults the bypass set here: the
@@ -334,7 +425,11 @@ where
             // match the global arm; with no carrier route the stage's own
             // resolver seam stays authoritative.
             {
-                let client_host = facts.host.as_deref().map(host_of_authority);
+                // The connecting peer (not the resolved client and never the
+                // `Host` header) is what the trusted-proxy arm compares: the
+                // reference `request.client_host`.
+                let peer_text = peer.map(|ip| ip.to_string());
+                let client_host = peer_text.as_deref();
                 let answer = if let Some(stage) = layer.https_enforcement() {
                     if let Some(route) = route {
                         stage.decide_route(
@@ -448,9 +543,17 @@ where
                     authorization_header_required: route.authorization_header_required.clone(),
                 };
                 if rules.has_rules() {
+                    // The reference reads the route verifier first and the
+                    // global `auth_verifier` as the fallback.
                     let verifiers = guard_core_engine::headers_auth::RouteVerifiers {
-                        auth: route.auth_verifier.clone(),
-                        api_key: route.api_key_verifier.clone(),
+                        auth: route
+                            .auth_verifier
+                            .clone()
+                            .or_else(|| layer.auth_verifier().cloned()),
+                        api_key: route
+                            .api_key_verifier
+                            .clone()
+                            .or_else(|| layer.auth_verifier().cloned()),
                     };
                     let pairs = header_pairs(&parts.headers);
                     if let Some(block) =
@@ -661,6 +764,11 @@ where
             // to the global config); an invalid route selector fails secure
             // (the reference validates at decoration time).
             if !bypassed("clouds") {
+                // The reference `CloudIpRefreshCheck`: schedule a refresh
+                // when the interval elapsed (single-flight).
+                if let Some(refresh) = layer.cloud_refresh_state() {
+                    let _ = refresh.refresh_if_due();
+                }
                 let route_selectors = route
                     .filter(|route| !route.block_cloud_providers.is_empty())
                     .map(|route| {
@@ -820,35 +928,165 @@ where
                 return Ok(block_response(&parts, &layer, status, ""));
             }
 
-            forward(&layer, &facts, parts, buffered, Some(started), inner).await
+            let rebuilt = B::from(buffered.unwrap_or_default());
+            forward(&layer, &facts, parts, rebuilt, started, inner, false).await
         })
     }
 }
 
-/// Forward the buffered request to the wrapped service, then run the
-/// response-side pass (behavioral return rules + security headers + CORS)
-/// over the produced response when a response processor is installed.
-/// `started` is the instant the request reached the guard: when set and a
-/// metrics collector is installed, the request metrics are emitted as soon
-/// as the response head is back (the response time stops there).
-async fn forward<S, B, B2>(
+/// Resolve the request's client through the layer's policy and install the
+/// resolved identity as the [`GuardClientIp`] extension (removing it when the
+/// request is unattributed). Returns whether the request must be rejected
+/// (`fail_secure` with no peer and nothing resolvable) and the connecting
+/// peer as the host supplied it.
+fn resolve_client(layer: &GuardLayer, parts: &mut Parts) -> (bool, Option<std::net::IpAddr>) {
+    let peer = parts.extensions.get::<GuardClientIp>().map(|ip| ip.0);
+    let forwarded = forwarded_for(&parts.headers);
+    let resolution = layer.client_policy().resolve(peer, forwarded.as_deref());
+    match resolution.ip {
+        Some(ip) => {
+            parts.extensions.insert(GuardClientIp(ip));
+        }
+        None => {
+            parts.extensions.remove::<GuardClientIp>();
+        }
+    }
+    (resolution.reject, peer)
+}
+
+/// The raw `X-Forwarded-For` value: repeated header lines join with a comma,
+/// exactly the single list a proxy chain appends to.
+fn forwarded_for(headers: &HeaderMap) -> Option<String> {
+    let values: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    (!values.is_empty()).then(|| values.join(", "))
+}
+
+/// The sensitive-name sets the redactions read: the installed
+/// observability knobs, the engine defaults otherwise.
+fn sensitive_names(layer: &GuardLayer) -> guard_core_rs::redact::SensitiveNames {
+    layer.observability().map_or_else(
+        guard_core_rs::redact::SensitiveNames::default,
+        |observability| observability.sensitive.clone(),
+    )
+}
+
+/// The reference `handle_passthrough` rejection: `403 Client address could
+/// not be determined`, the `on_block` hook under the
+/// `client_address_unresolved` check name, then the normal block response
+/// pass.
+fn unresolved_client_response<B2>(parts: &Parts, layer: &GuardLayer) -> Response<GuardBody<B2>> {
+    use guard_core_engine::ip_extraction::{
+        UNRESOLVABLE_CLIENT_ADDRESS_CHECK_NAME, UNRESOLVABLE_CLIENT_ADDRESS_MESSAGE,
+        UNRESOLVABLE_CLIENT_ADDRESS_STATUS,
+    };
+    let status = UNRESOLVABLE_CLIENT_ADDRESS_STATUS;
+    let observation = request_observation(parts);
+    let payload = build_block_payload(
+        UNRESOLVABLE_CLIENT_ADDRESS_CHECK_NAME,
+        UNRESOLVABLE_CLIENT_ADDRESS_MESSAGE,
+        "",
+        false,
+        "",
+        observation.url.as_deref().unwrap_or("/"),
+        observation.method.as_deref().unwrap_or(""),
+        Some(status),
+        &sensitive_names(layer),
+    );
+    fire_block_hook(layer.on_block(), &payload);
+    let body = resolve_error_body(
+        layer.custom_error_responses(),
+        status,
+        UNRESOLVABLE_CLIENT_ADDRESS_MESSAGE,
+    );
+    block_response(parts, layer, status, &body)
+}
+
+/// The reference `security_bypass` event of an all-checks-bypass route.
+fn emit_security_bypass_event(layer: &GuardLayer, facts: &RequestFacts, route: &RouteConfig) {
+    let Some(bus) = &layer.events else {
+        return;
+    };
+    let mut event = guard_core_rs::events::SecurityEvent::new(
+        guard_core_rs::event_types::EVENT_SECURITY_BYPASS,
+        &facts.ip_string,
+        "all_checks_bypassed",
+        "Route configured to bypass all security checks",
+        "middleware",
+    );
+    event.endpoint = Some(guard_core_rs::redact::redact_url_for_display(
+        &facts.path,
+        &sensitive_names(layer),
+    ));
+    event.method = Some(facts.method.clone());
+    event.metadata.insert(
+        "bypassed_checks".to_owned(),
+        serde_json::Value::from(route.bypassed_checks.iter().cloned().collect::<Vec<_>>()),
+    );
+    bus.send_event(&event);
+}
+
+/// Forward an all-checks-bypass request: the real downstream sees the
+/// untouched request, and only the response modifier runs on the way back.
+async fn forward_bypassed<S, B, B2>(
     layer: &GuardLayer,
     facts: &RequestFacts,
     parts: Parts,
-    buffered: Option<Bytes>,
-    started: Option<Instant>,
+    body: B,
     mut inner: S,
 ) -> Result<Response<GuardBody<B2>>, S::Error>
 where
     S: Service<Request<B>, Response = Response<B2>>,
-    B: Body<Data = Bytes> + From<Bytes>,
 {
-    let rebuilt = B::from(buffered.unwrap_or_default());
     let mut response = inner
-        .call(Request::from_parts(parts, rebuilt))
+        .call(Request::from_parts(parts, body))
         .await?
         .map(GuardBody::Passthrough);
-    if let (Some(metrics), Some(started)) = (layer.metrics.as_ref(), started) {
+    let modified = apply_modifier_only(
+        layer,
+        &ProcessorInput::from_facts(facts, false),
+        response.status().as_u16(),
+        response.headers_mut(),
+    );
+    if let Some(status) = modified
+        && let Ok(code) = http::StatusCode::from_u16(status)
+    {
+        *response.status_mut() = code;
+    }
+    Ok(response)
+}
+
+/// Forward the request to the wrapped service, then run the response-side
+/// pass (behavioral return rules + security headers + CORS + modifier) over
+/// the produced response. The request metrics are emitted as soon as the
+/// response head is back (the response time stops there). `scoped` is the
+/// `exclude_paths` pass: no return rules, everything else as usual.
+///
+/// When the processor evaluates return rules on the response body, the body
+/// is buffered (the whole body, re-emitted intact downstream) and the
+/// inspected prefix is bounded by the processor's
+/// `behavior_max_response_body_inspect_bytes`; a body read error answers the
+/// fail-secure `500`. Status-only rules never buffer.
+async fn forward<S, B, B2>(
+    layer: &GuardLayer,
+    facts: &RequestFacts,
+    parts: Parts,
+    body: B,
+    started: Instant,
+    mut inner: S,
+    scoped: bool,
+) -> Result<Response<GuardBody<B2>>, S::Error>
+where
+    S: Service<Request<B>, Response = Response<B2>>,
+    B2: Body<Data = Bytes> + Unpin,
+    B2::Error: Into<BoxError>,
+{
+    let input = ProcessorInput::from_facts(facts, scoped);
+    let response = inner.call(Request::from_parts(parts, body)).await?;
+    if let Some(metrics) = layer.metrics.as_ref() {
         metrics.collect_request_metrics(
             &facts.path,
             &facts.method,
@@ -856,12 +1094,34 @@ where
             response.status().as_u16(),
         );
     }
+    let wants_body = !scoped
+        && layer
+            .response_processor()
+            .is_some_and(|processor| processor.needs_response_body());
+    let (mut response, prefix) = if wants_body {
+        let (head, response_body) = response.into_parts();
+        let Ok(collected) = response_body.collect().await else {
+            return Ok(finish_generated_input(&input, layer, response::failure()));
+        };
+        let full = collected.to_bytes();
+        let limit = layer
+            .response_processor()
+            .map_or(0, |processor| processor.max_inspect_bytes());
+        let prefix = full.slice(..full.len().min(limit));
+        (
+            Response::from_parts(head, GuardBody::Generated(Full::new(full))),
+            Some(prefix),
+        )
+    } else {
+        (response.map(GuardBody::Passthrough), None)
+    };
     let modified = apply_response_processor(
         layer,
-        &ProcessorInput::from_facts(facts),
+        &input,
         response.status().as_u16(),
         response.headers_mut(),
         ResponseLane::Forwarded,
+        prefix.as_deref(),
     );
     if let Some(status) = modified
         && let Ok(code) = http::StatusCode::from_u16(status)
@@ -877,17 +1137,21 @@ struct ProcessorInput {
     url_path: String,
     client_ip: String,
     origin: Option<String>,
+    /// The request matched `exclude_paths`: the scoped pass (no return
+    /// rules).
+    scoped: bool,
 }
 
 impl ProcessorInput {
     /// The same pieces lifted from the extracted request facts (the
     /// forwarded-response path).
-    fn from_facts(facts: &RequestFacts) -> Self {
+    fn from_facts(facts: &RequestFacts, scoped: bool) -> Self {
         Self {
             method: facts.method.clone(),
             url_path: facts.path.clone(),
             client_ip: facts.ip_string.clone(),
             origin: facts.origin.clone(),
+            scoped,
         }
     }
 
@@ -905,6 +1169,19 @@ impl ProcessorInput {
                 .get(http::header::ORIGIN)
                 .and_then(|value| value.to_str().ok())
                 .map(ToOwned::to_owned),
+            scoped: parts
+                .extensions
+                .get::<crate::GuardExclusionScoped>()
+                .is_some(),
+        }
+    }
+
+    fn request_bits(&self) -> RequestBits {
+        RequestBits {
+            method: self.method.clone(),
+            url_path: self.url_path.clone(),
+            client_ip: self.client_ip.clone(),
+            origin: self.origin.clone(),
         }
     }
 }
@@ -969,12 +1246,14 @@ fn emit_headers_applied_event(
     ));
 }
 
-/// Run the response-side pass when a processor is installed: the global
-/// `return_pattern` rules evaluate the response (a crossed `ban` lands in
-/// the processor's IP-ban store), then the security-header set and the
-/// CORS verdict headers land on the response. The response body is not
-/// captured (`body_prefix = None`): `status:` rules evaluate, body rules
-/// skip, exactly the reference's no-capture seam.
+/// Run the response-side pass: the global `return_pattern` rules evaluate
+/// the response (a crossed `ban` lands in the processor's IP-ban store;
+/// skipped for a scoped `exclude_paths` request), then the security-header
+/// set and the CORS verdict headers land on the response, and the
+/// `custom_response_modifier` runs last. `body_prefix` is the buffered
+/// response body prefix when the processor asked for one (`None`: `status:`
+/// rules evaluate, body rules skip). Without a processor only the modifier
+/// runs.
 ///
 /// The lane decides the `security_headers_applied` funnel: a forwarded
 /// response composes the event over the landed set and dispatches it over
@@ -988,41 +1267,69 @@ fn apply_response_processor(
     status: u16,
     headers: &mut HeaderMap,
     lane: ResponseLane,
+    body_prefix: Option<&[u8]>,
 ) -> Option<u16> {
-    let processor = layer.response_processor()?;
+    let mut bits = ResponseBits {
+        status,
+        body: body_prefix.map(|prefix| String::from_utf8_lossy(prefix).into_owned()),
+        headers: BTreeMap::new(),
+    };
+    let request = input.request_bits();
+    if let Some(processor) = layer.response_processor() {
+        let _action = if input.scoped {
+            processor.process_scoped(&request, &mut bits, SystemTime::now())
+        } else {
+            processor.process(&request, &mut bits, body_prefix, SystemTime::now())
+        };
+        emit_headers_applied_event(layer, processor, input, lane);
+    }
+    run_layer_modifier(layer, input, &mut bits);
+    land_response_bits(bits, status, headers)
+}
+
+/// Only the modifiers (the all-checks-bypass route): the processor's own,
+/// then the layer's.
+fn apply_modifier_only(
+    layer: &GuardLayer,
+    input: &ProcessorInput,
+    status: u16,
+    headers: &mut HeaderMap,
+) -> Option<u16> {
     let mut bits = ResponseBits {
         status,
         body: None,
         headers: BTreeMap::new(),
     };
-    let request = RequestBits {
-        method: input.method.clone(),
-        url_path: input.url_path.clone(),
-        client_ip: input.client_ip.clone(),
-        origin: input.origin.clone(),
-    };
-    let _action = processor.process(&request, &mut bits, None, SystemTime::now());
-    emit_headers_applied_event(layer, processor, input, lane);
+    if let Some(processor) = layer.response_processor() {
+        processor.apply_modifier(&input.request_bits(), &mut bits);
+    }
+    run_layer_modifier(layer, input, &mut bits);
+    land_response_bits(bits, status, headers)
+}
 
-    // The reference `custom_response_modifier`: the callback runs LAST
-    // over the response view. A panicking callback restores the
-    // unmodified view (the reference's except arm) and reports through
-    // the `on_error` hook.
-    if let Some(modifier) = &layer.response_modifier {
-        let unmodified = bits.clone();
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| modifier(&mut bits)));
-        if outcome.is_err() {
-            bits = unmodified;
-            if let Some(hook) = &layer.on_error {
-                hook(
-                    "custom_response_modifier",
-                    "the response modifier panicked; returning unmodified response",
-                    &[("path".to_owned(), input.url_path.clone())],
-                );
-            }
+/// The reference `custom_response_modifier`: the callback runs LAST over
+/// the response view. A panicking callback restores the unmodified view
+/// (the reference's except arm) and reports through the `on_error` hook.
+fn run_layer_modifier(layer: &GuardLayer, input: &ProcessorInput, bits: &mut ResponseBits) {
+    let Some(modifier) = &layer.response_modifier else {
+        return;
+    };
+    let unmodified = bits.clone();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| modifier(bits)));
+    if outcome.is_err() {
+        *bits = unmodified;
+        if let Some(hook) = &layer.on_error {
+            hook(
+                "custom_response_modifier",
+                "the response modifier panicked; returning unmodified response",
+                &[("path".to_owned(), input.url_path.clone())],
+            );
         }
     }
+}
+
+/// Land the pass's header set on the response and report a rewritten status.
+fn land_response_bits(bits: ResponseBits, status: u16, headers: &mut HeaderMap) -> Option<u16> {
     let modified_status = (bits.status != status).then_some(bits.status);
     for (name, value) in bits.headers {
         #[cfg(not(coverage))] // unreachable: the processor renders the
@@ -1051,15 +1358,25 @@ fn apply_response_processor(
 fn finish_generated<B2>(
     parts: &Parts,
     layer: &GuardLayer,
+    generated: Response<Full<Bytes>>,
+) -> Response<GuardBody<B2>> {
+    finish_generated_input(&ProcessorInput::from_parts(parts), layer, generated)
+}
+
+/// [`finish_generated`] over pre-lifted request pieces (the forwarded lane,
+/// whose request parts were moved into the wrapped service).
+fn finish_generated_input<B2>(
+    input: &ProcessorInput,
+    layer: &GuardLayer,
     mut generated: Response<Full<Bytes>>,
 ) -> Response<GuardBody<B2>> {
-    let input = ProcessorInput::from_parts(parts);
     let modified = apply_response_processor(
         layer,
-        &input,
+        input,
         generated.status().as_u16(),
         generated.headers_mut(),
         ResponseLane::Generated,
+        None,
     );
     if let Some(status) = modified
         && let Ok(code) = http::StatusCode::from_u16(status)
@@ -1165,19 +1482,6 @@ fn request_observation(parts: &Parts) -> RequestObservation {
     }
 }
 
-/// The bare host of an authority string (port stripped, IPv6 brackets
-/// removed): the connecting identity the trusted-proxy arm compares.
-fn host_of_authority(value: &str) -> &str {
-    let host_port = value.rsplit('@').next().unwrap_or_default();
-    if let Some(rest) = host_port.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(rest);
-    }
-    match host_port.split_once(':') {
-        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
-        _ => host_port,
-    }
-}
-
 /// The answer body of a geo/cloud/user-agent stage answer. The reference
 /// custom-error override never rides these answers (the stages construct
 /// them with `custom_body: None`; the override resolves inside the
@@ -1256,6 +1560,7 @@ fn block_response_owned(
         status,
         generated.headers_mut(),
         ResponseLane::Generated,
+        None,
     );
     if let Some(modified) = modified
         && let Ok(code) = http::StatusCode::from_u16(modified)
@@ -1622,6 +1927,7 @@ mod tests {
         Request::builder()
             .uri(uri)
             .header("x-forwarded-for", "203.0.113.9")
+            .extension(gate_ip("203.0.113.9"))
             .body(Full::new(Bytes::new()))
             .expect("request")
     }
@@ -1641,6 +1947,14 @@ mod tests {
         status_and_body(layer, request).await
     }
 
+    struct NoCountry;
+
+    impl guard_core_engine::geo::GeoIpHandler for NoCountry {
+        fn get_country(&self, _ip: IpAddr) -> Option<String> {
+            None
+        }
+    }
+
     #[tokio::test]
     async fn the_country_level_alone_installs_observability_and_composes() {
         // A suspicious level of None with the country level set: the
@@ -1648,9 +1962,12 @@ mod tests {
         let config = SecurityConfig {
             log_suspicious_level: None,
             blocked_countries: [String::from("RU")].into_iter().collect(),
+            geo_ip_handler: Some(Arc::new(NoCountry)),
             ..SecurityConfig::default()
         };
         let layer = GuardLayer::from_security_config(&config).expect("valid config");
+        let (status, _) = config_status_and_body_layer(&layer, benign_request("203.0.113.9")).await;
+        assert_eq!(status, StatusCode::OK, "an unresolved country passes");
         let observability = layer.observability().expect("the country default");
         assert_eq!(observability.log_suspicious_level, None);
         assert!(
@@ -1744,6 +2061,7 @@ mod tests {
         let attack = Request::builder()
             .uri("/scan?a=benign-one&b=benign-two&c=1%20UNION%20SELECT%20password")
             .header("x-forwarded-for", "203.0.113.9")
+            .extension(gate_ip("203.0.113.9"))
             .body(Full::new(Bytes::new()))
             .expect("request");
         let (status, _) = config_status_and_body(&config, attack).await;
@@ -1758,6 +2076,7 @@ mod tests {
         let attack_again = Request::builder()
             .uri("/scan?a=benign-one&b=benign-two&c=1%20UNION%20SELECT%20password")
             .header("x-forwarded-for", "203.0.113.9")
+            .extension(gate_ip("203.0.113.9"))
             .body(Full::new(Bytes::new()))
             .expect("request");
         let (status, _) = config_status_and_body(&SecurityConfig::default(), attack_again).await;
@@ -1816,7 +2135,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn from_security_config_exclude_paths_bypass_the_pipeline() {
+    async fn from_security_config_exclude_paths_run_the_scoped_pipeline() {
+        // The reference scoped pipeline: an excluded path skips detection
+        // but still answers the global IP rules.
         let config = SecurityConfig {
             blacklist: vec![String::from("203.0.113.9")],
             exclude_paths: vec![String::from("/docs")],
@@ -1825,8 +2146,12 @@ mod tests {
         let layer = GuardLayer::from_security_config(&config).expect("valid config");
         let mut docs = benign_request("203.0.113.9");
         *docs.uri_mut() = http::Uri::from_static("/docs");
-        let (bypassed, _) = status_and_body(&layer, docs).await;
-        assert_eq!(bypassed, StatusCode::OK);
+        let (blacklisted, _) = status_and_body(&layer, docs).await;
+        assert_eq!(blacklisted, StatusCode::FORBIDDEN);
+        let mut other = benign_request("203.0.113.10");
+        *other.uri_mut() = http::Uri::from_static("/docs/x?q=1%20UNION%20SELECT%20password");
+        let (scoped, _) = status_and_body(&layer, other).await;
+        assert_eq!(scoped, StatusCode::OK, "detection is skipped for /docs/x");
         let (blocked, _) = status_and_body(&layer, benign_request("203.0.113.9")).await;
         assert_eq!(blocked, StatusCode::FORBIDDEN);
     }
@@ -2052,14 +2377,20 @@ mod tests {
     #[tokio::test]
     async fn from_security_config_empty_category_set_skips_the_exclusion_block() {
         // The reference's empty `enabled_detection_categories` frozenset:
-        // an explicitly empty set disables every category, and the
-        // detection-exclusion block is not installed at all.
+        // an explicitly empty set resolves to no category restriction
+        // (`None`), exactly the wiring's reading.
         let config = SecurityConfig {
             enabled_detection_categories: std::collections::BTreeSet::new(),
             ..SecurityConfig::default()
         };
         let layer = GuardLayer::from_security_config(&config).expect("valid config");
-        assert!(layer.detection_exclusions().is_none());
+        assert!(
+            layer
+                .detection_exclusions()
+                .expect("the wiring always installs the exclusions")
+                .enabled_detection_categories
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2680,9 +3011,16 @@ mod tests {
             url_path: "/hello".to_owned(),
             client_ip: "203.0.113.9".to_owned(),
             origin: None,
+            scoped: false,
         };
-        let modified =
-            apply_response_processor(&layer, &input, 200, &mut headers, ResponseLane::Forwarded);
+        let modified = apply_response_processor(
+            &layer,
+            &input,
+            200,
+            &mut headers,
+            ResponseLane::Forwarded,
+            None,
+        );
         assert_eq!(modified, Some(201), "the status rewrite propagates");
         assert_eq!(
             headers
@@ -2714,9 +3052,16 @@ mod tests {
             url_path: "/hello".to_owned(),
             client_ip: "203.0.113.9".to_owned(),
             origin: None,
+            scoped: false,
         };
-        let modified =
-            apply_response_processor(&layer, &input, 200, &mut headers, ResponseLane::Forwarded);
+        let modified = apply_response_processor(
+            &layer,
+            &input,
+            200,
+            &mut headers,
+            ResponseLane::Forwarded,
+            None,
+        );
         assert_eq!(modified, None);
         assert!(
             headers.get("x-content-type-options").is_some(),
@@ -4556,6 +4901,7 @@ mod tests {
                 http::Request::builder()
                     .method("OPTIONS")
                     .uri("/api")
+                    .extension(gate_ip("203.0.113.9"))
                     .body(Full::new(Bytes::new()))
                     .expect("request"),
             )

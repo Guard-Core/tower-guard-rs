@@ -2,6 +2,29 @@
 
 All notable changes to this project.
 
+Unreleased
+----------
+
+### Added
+
+- Client resolution (the reference `handle_passthrough` and `extract_client_ip`): the connecting peer (`GuardClientIp`) is resolved through a `ClientPolicy` (`trusted_proxies`, `trusted_proxy_depth`, `fail_secure`, new builder `with_client_policy`) and the resolved identity replaces the peer for the gate, bans, rate limits, geo, cloud, events and the response pass; a request with no resolvable client address answers `403 Client address could not be determined` under `fail_secure` (the `from_security_config` default) and fires `on_block` under the `client_address_unresolved` check, builder layers default to `fail_secure = false`
+- `from_security_config_with(config, WiringOptions)` and `from_wiring(Wiring)`: the telemetry agent is injected through the facade's `TelemetryHandler`, which wires the event bus, the request metrics, `agent_stats()` (now reporting `enabled` and `degraded` from the sink), `spawn_dynamic_rules()` (host-started poll loop) and the cloud refresh (per-request `refresh_if_due` at the cloud position plus `refresh_cloud_ip_ranges`)
+- The `GuardExclusionScoped` request extension, the `security_bypass` event for all-checks-bypass routes, the global `auth_verifier` as the fallback verifier of a route that carries none (`with_auth_verifier`), and re-exports of `ResponseBits`, `RequestBits`, `SecurityMetric`, `SecurityEvent`, `CustomResponse`, `CloudRefreshScheduler`, `StoreError` and the wiring types
+- `GuardConfigError` gains `Cloud`, `Redis` and `Geo` variants
+
+### Changed
+
+- `exclude_paths` now uses the engine matcher (prefix on a `/` boundary, percent-decoded, dot-collapsed) and runs the scoped pipeline instead of bypassing everything: bans, the global IP, country and cloud rules and the rate limit still apply to an excluded request, which now also emits request metrics and gets the response pass without return rules
+- `from_security_config` goes through the facade `Wiring`: geo country rules, cloud providers, endpoint rate limits, rate-limit auto-ban, the custom request check, the auth verifier, trusted proxies, the config response modifier, `on_error`, `cors_expose_headers`, Redis stores and the telemetry knobs are now installed (previously dropped); country rules without a `geo_ip_handler` or `ipinfo_token` fail closed with `GuardConfigError::Geo`; the detection exclusions block is always installed
+- The response modifier runs even when no `ResponseProcessor` is installed, return rules evaluate the response body when the processor asks for it (the body is buffered and re-emitted, a read error answers the fail-secure `500`), and an all-checks-bypass route is forwarded with only the modifier applied (passive mode keeps it in the pipeline)
+- `GuardLayer::agent_stats` and `GuardService::agent_stats` are no longer `const fn`
+
+### Fixed
+
+- A whitelisted or exempt IP now skips the geo, cloud and user-agent stages as the stages document (the gate decision was read before the gate ran)
+- The HTTPS stage compared the `Host` header against `trusted_proxies`; it now compares the connecting peer, so `X-Forwarded-Proto` is trusted only from a trusted proxy
+- The README no longer contradicts itself on the status route and the WebSocket guard, and the stale version and engine pin notes are corrected
+
 v1.5.0 (2026-10-09)
 -------------------
 

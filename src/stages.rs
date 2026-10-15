@@ -209,27 +209,15 @@ impl Decides for EmergencyModeStage {
     }
 }
 
-/// The bare host of an authority string: the port stripped and IPv6
-/// brackets removed (the connecting-identity shape the trusted-proxy arm
-/// compares). Mirrors the engine stage service's own extraction.
-fn host_of_authority(value: &str) -> &str {
-    let host_port = value.rsplit('@').next().unwrap_or_default();
-    if let Some(rest) = host_port.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(rest);
-    }
-    match host_port.split_once(':') {
-        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
-        _ => host_port,
-    }
-}
-
 impl Decides for HttpsEnforcementStage {
     fn decide(&self, facts: &RequestFacts, _headers: &[(&str, &str)]) -> Option<StageVerdict> {
-        let client_host = facts.host.as_deref().map(host_of_authority);
+        // The connecting peer is what the trusted-proxy arm compares (the
+        // reference `request.client_host`), never the `Host` header.
+        let peer = facts.ip.map(|ip| ip.to_string());
         self.decide(
             &facts.path,
             &facts.scheme,
-            client_host,
+            peer.as_deref(),
             facts.x_forwarded_proto.as_deref(),
             &facts.https_url(),
         )
@@ -843,21 +831,6 @@ mod tests {
             .0;
         let facts = RequestFacts::extract(&parts);
         assert_eq!(facts.https_url(), "https:///private");
-    }
-
-    #[test]
-    fn host_of_authority_strips_ports_brackets_and_userinfo() {
-        assert_eq!(host_of_authority("guard.example:8443"), "guard.example");
-        assert_eq!(host_of_authority("guard.example"), "guard.example");
-        assert_eq!(host_of_authority("[2001:db8::1]:443"), "2001:db8::1");
-        assert_eq!(host_of_authority("[2001:db8::1]"), "2001:db8::1");
-        assert_eq!(
-            host_of_authority("user@guard.example:8443"),
-            "guard.example"
-        );
-        // A non-digit port is part of the host string (the comparison arm).
-        assert_eq!(host_of_authority("guard.example:abc"), "guard.example:abc");
-        assert_eq!(host_of_authority(""), "");
     }
 
     #[tokio::test]
