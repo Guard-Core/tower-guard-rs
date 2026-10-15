@@ -27,7 +27,7 @@ use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use tower::Service;
 
 /// Header names that are never scanned, mirroring the TypeScript adapters'
@@ -149,6 +149,7 @@ where
         let inner = self.inner.clone();
         let layer = self.layer.clone();
         Box::pin(async move {
+            let started = Instant::now();
             let (mut parts, mut body) = request.into_parts();
             let facts = RequestFacts::extract(&parts);
 
@@ -156,7 +157,7 @@ where
             // docs/static paths bypass the whole pipeline (exact path
             // match), detection included.
             if layer.exclude_paths.contains(&facts.path) {
-                return forward(&layer, &facts, parts, None, inner).await;
+                return forward(&layer, &facts, parts, None, None, inner).await;
             }
 
             // The reference's CORS preflight short-circuit: an OPTIONS
@@ -819,7 +820,7 @@ where
                 return Ok(block_response(&parts, &layer, status, ""));
             }
 
-            forward(&layer, &facts, parts, buffered, inner).await
+            forward(&layer, &facts, parts, buffered, Some(started), inner).await
         })
     }
 }
@@ -827,11 +828,15 @@ where
 /// Forward the buffered request to the wrapped service, then run the
 /// response-side pass (behavioral return rules + security headers + CORS)
 /// over the produced response when a response processor is installed.
+/// `started` is the instant the request reached the guard: when set and a
+/// metrics collector is installed, the request metrics are emitted as soon
+/// as the response head is back (the response time stops there).
 async fn forward<S, B, B2>(
     layer: &GuardLayer,
     facts: &RequestFacts,
     parts: Parts,
     buffered: Option<Bytes>,
+    started: Option<Instant>,
     mut inner: S,
 ) -> Result<Response<GuardBody<B2>>, S::Error>
 where
@@ -843,6 +848,14 @@ where
         .call(Request::from_parts(parts, rebuilt))
         .await?
         .map(GuardBody::Passthrough);
+    if let (Some(metrics), Some(started)) = (layer.metrics.as_ref(), started) {
+        metrics.collect_request_metrics(
+            &facts.path,
+            &facts.method,
+            Some(started.elapsed().as_secs_f64()),
+            response.status().as_u16(),
+        );
+    }
     let modified = apply_response_processor(
         layer,
         &ProcessorInput::from_facts(facts),
@@ -1491,6 +1504,114 @@ mod tests {
             .extension(gate_ip(ip))
             .body(Full::new(Bytes::new()))
             .expect("request")
+    }
+
+    // --- per-request metrics (the reference `collect_request_metrics`) ---
+
+    type SeenMetrics = Arc<Mutex<Vec<guard_core_rs::metrics::SecurityMetric>>>;
+
+    fn recording_metrics(enabled: bool) -> (guard_core_rs::metrics::MetricsCollector, SeenMetrics) {
+        let seen: SeenMetrics = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let collector = guard_core_rs::metrics::MetricsCollector::new(enabled).with_handler(
+            Arc::new(move |metric: &guard_core_rs::metrics::SecurityMetric| {
+                sink.lock().expect("sink").push(metric.clone());
+            }),
+        );
+        (collector, seen)
+    }
+
+    fn metric_summary(seen: &SeenMetrics) -> Vec<(String, Option<String>)> {
+        let mut rows: Vec<(String, Option<String>)> = seen
+            .lock()
+            .expect("sink")
+            .iter()
+            .map(|metric| {
+                (
+                    metric.metric_type.clone(),
+                    metric.tags.get("status").cloned(),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_request_emits_count_and_response_time() {
+        let (collector, seen) = recording_metrics(true);
+        let layer = GuardLayer::new(default_config()).with_metrics(collector);
+        let (status, _) = status_and_body(&layer, benign_request("203.0.113.9")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            metric_summary(&seen),
+            vec![
+                ("request_count".to_owned(), None),
+                ("response_time".to_owned(), Some("200".to_owned())),
+            ]
+        );
+        let seen = seen.lock().expect("sink");
+        let time = seen
+            .iter()
+            .find(|metric| metric.metric_type == "response_time")
+            .expect("response_time");
+        assert!(time.value >= 0.0);
+        assert_eq!(
+            time.tags.get("endpoint").map(String::as_str),
+            Some("/hello")
+        );
+        assert_eq!(time.tags.get("method").map(String::as_str), Some("GET"));
+    }
+
+    #[tokio::test]
+    async fn a_5xx_forwarded_response_also_emits_error_rate() {
+        let (collector, seen) = recording_metrics(true);
+        let layer = GuardLayer::new(default_config()).with_metrics(collector);
+        let service = layer.layer(tower::service_fn(
+            |_request: Request<Full<Bytes>>| async move {
+                let mut response = http::Response::new(Full::new(Bytes::new()));
+                *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                Ok::<_, Infallible>(response)
+            },
+        ));
+        let response = service
+            .oneshot(benign_request("203.0.113.9"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            metric_summary(&seen),
+            vec![
+                ("error_rate".to_owned(), Some("503".to_owned())),
+                ("request_count".to_owned(), None),
+                ("response_time".to_owned(), Some("503".to_owned())),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_metrics_without_a_collector_or_when_disabled_or_blocked_or_excluded() {
+        // No collector installed: nothing to emit, the request still passes.
+        let layer = GuardLayer::new(default_config());
+        let (status, _) = status_and_body(&layer, benign_request("203.0.113.9")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // `agent_enable_metrics = false` gates inside the collector.
+        let (collector, seen) = recording_metrics(false);
+        let layer = GuardLayer::new(default_config()).with_metrics(collector);
+        status_and_body(&layer, benign_request("203.0.113.9")).await;
+        assert!(seen.lock().expect("sink").is_empty());
+
+        // A guard block is not a pass-through response.
+        let (collector, seen) = recording_metrics(true);
+        let layer = GuardLayer::new(default_config()).with_metrics(collector);
+        let (status, _) = status_and_body(
+            &layer,
+            attack_request("/?q=%3Cscript%3Ealert(1)%3C/script%3E"),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK);
+        assert!(seen.lock().expect("sink").is_empty());
     }
 
     // --- the unified SecurityConfig consumption (from_security_config) ---
