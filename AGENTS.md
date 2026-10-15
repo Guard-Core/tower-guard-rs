@@ -27,7 +27,7 @@ Downstream consumers: `axum-guard-rs` re-exports this crate's `GuardLayer`/`with
 ## Boundary Rules
 
 - **No security logic in this crate.** Detection comes from `guard-core-engine`'s `detect`. Policy values (thresholds, caps) are configuration, not logic.
-- **No framework dependencies.** This crate depends on `http`, `http-body`, `http-body-util`, `bytes`, `tower`, and the engine. Never add `axum`, `hyper`, `actix-web`, `rocket`, or a tokio runtime dependency to `[dependencies]`. tokio belongs in `[dev-dependencies]` for tests only.
+- **No framework dependencies.** This crate depends on `http`, `http-body`, `http-body-util`, `bytes`, `tower`, and the engine. Never add `axum`, `hyper`, `actix-web`, `rocket`, or a tokio runtime dependency to `[dependencies]`. tokio belongs in `[dev-dependencies]` for tests only. The one exception is the optional `agent` feature, which pulls guard-agent-rs and tokio's `rt` feature to build the telemetry agent from the config (guard-agent-rs depends on the facade, so the facade cannot own that step); the default build has neither. `body_read_timeout` is enforced through a host-supplied timer (`with_body_timer`) for the same reason.
 - **No modifications to the engine.** Engine behavior changes are `guard-core-rs` PRs.
 - **Fail-secure, always.** A body read error, an engine panic, or a body over the cap must never result in an uninspected passthrough. Failures answer `500` (or `413` for oversize).
 
