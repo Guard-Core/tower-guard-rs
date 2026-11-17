@@ -663,7 +663,7 @@ where
                     timezone: restrictions.get("timezone").cloned(),
                 };
                 let current = guard_core_engine::time_window::hhmm_in_zone(
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                     window.timezone.as_deref(),
                 );
                 if !guard_core_engine::time_window::is_within(&window, &current) {
@@ -4768,12 +4768,12 @@ mod tests {
 
     #[tokio::test]
     async fn fused_time_window_gate_blocks_outside_the_window() {
-        let now = chrono::Utc::now();
-        let start = (now + chrono::Duration::minutes(2))
-            .format("%H:%M")
+        let now = jiff::Timestamp::now();
+        let start = (now + jiff::SignedDuration::from_mins(2))
+            .strftime("%H:%M")
             .to_string();
-        let end = (now + chrono::Duration::minutes(3))
-            .format("%H:%M")
+        let end = (now + jiff::SignedDuration::from_mins(3))
+            .strftime("%H:%M")
             .to_string();
         let stage = guard_core_rs::route_gates::TimeWindowStage::builder(
             guard_core_rs::route_gates::GateConfig::default(),
@@ -5727,9 +5727,8 @@ mod tests {
         // twins stay deterministic: a plain span ending before `now`
         // blocks, a span straddling `now` passes.
         let now_minutes = {
-            use chrono::Timelike;
-            let now = chrono::Utc::now();
-            i64::from(now.hour() * 60 + now.minute())
+            let now = jiff::Timestamp::now().to_zoned_datetime(jiff::tz::TimeZone::UTC);
+            i64::from(now.hour()) * 60 + i64::from(now.minute())
         };
         // Both plain-span shapes exclude `now` by construction, so the
         // twins stay deterministic whichever side of midnight the test
