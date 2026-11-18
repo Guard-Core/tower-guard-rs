@@ -2125,6 +2125,57 @@ mod tests {
         wrapped.stage = Some(Arc::new(wrapped.build_stage()));
         assert!(wrapped.rate_limit_stage().is_some());
     }
+
+    #[test]
+    fn reset_without_a_rate_limiter_changes_nothing() {
+        let layer = GuardLayer::with_defaults();
+        layer.reset();
+        assert!(layer.rate_limit_stage().is_none());
+    }
+
+    #[tokio::test]
+    async fn layering_a_layer_that_already_holds_its_stage_keeps_that_stage() {
+        use bytes::Bytes;
+        use http_body_util::Full;
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enable_rate_limiting: true,
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let mut prebuilt = GuardLayer::new(default_config()).with_rate_limiting(limiter);
+        prebuilt.stage = Some(Arc::new(prebuilt.build_stage()));
+        let service: GuardService<_> = Layer::layer(
+            &prebuilt,
+            tower::service_fn(|_: http::Request<Full<Bytes>>| async {
+                Ok::<_, std::convert::Infallible>(http::Response::new(Full::new(Bytes::new())))
+            }),
+        );
+        let request = http::Request::builder()
+            .uri("/health")
+            .body(Full::new(Bytes::new()))
+            .expect("static request");
+        let response = tower::ServiceExt::oneshot(service, request)
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), http::StatusCode::OK);
+    }
+
+    #[test]
+    fn a_live_config_that_no_longer_builds_installs_no_live_cell() {
+        let wiring = Wiring::from_security_config_with(
+            &SecurityConfig::default(),
+            &WiringOptions::default(),
+        )
+        .expect("valid config");
+        let context = wiring.live.clone();
+        context
+            .config()
+            .write()
+            .expect("live config")
+            .blocked_user_agents = vec![String::from("(")];
+        let layer = GuardLayer::new(default_config()).install_live(&context);
+        assert!(layer.live.is_none());
+    }
 }
 
 #[cfg(test)]
