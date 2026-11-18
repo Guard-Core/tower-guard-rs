@@ -3187,6 +3187,33 @@ mod tests {
         assert_eq!(seen[0].0, "custom_response_modifier");
     }
 
+    #[test]
+    fn a_panicking_response_modifier_without_an_error_hook_still_restores() {
+        let layer = GuardLayer::new(default_config())
+            .with_response_processor(bare_processor())
+            .with_custom_response_modifier(Arc::new(|_bits: &mut ResponseBits| {
+                panic!("modifier exploded");
+            }));
+        let mut headers = http::HeaderMap::new();
+        let input = ProcessorInput {
+            method: "GET".to_owned(),
+            url_path: "/hello".to_owned(),
+            client_ip: "203.0.113.9".to_owned(),
+            origin: None,
+            scoped: false,
+        };
+        let modified = apply_response_processor(
+            &layer,
+            &input,
+            200,
+            &mut headers,
+            ResponseLane::Forwarded,
+            None,
+        );
+        assert_eq!(modified, None);
+        assert!(headers.get("x-content-type-options").is_some());
+    }
+
     #[tokio::test]
     async fn a_status_rewrite_propagates_on_forward_and_generated_answers() {
         // Forward: the modifier's status rewrite reaches the client.
@@ -5179,6 +5206,90 @@ mod tests {
         );
         let (passed, _) = status_and_body(&layer, request).await;
         assert_eq!(passed, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn route_blocked_user_agents_apply_to_a_client_the_ip_gate_let_through() {
+        let gate = guard_core_engine::ip_gate::IpGateConfig::new(
+            [] as [&str; 0],
+            ["198.51.100.1"],
+            [] as [&str; 0],
+        )
+        .expect("valid lists");
+        let config = RouteConfig {
+            blocked_user_agents: vec![String::from("route-bot")],
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_ip_gate(gate)
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let mut request = request_at("/api", "192.0.2.9");
+        request.headers_mut().insert(
+            "user-agent",
+            http::HeaderValue::from_static("route-bot/2.0"),
+        );
+        let (blocked, body) = status_and_body(&layer, request).await;
+        assert_eq!(blocked, StatusCode::FORBIDDEN);
+        assert_eq!(body, "User-Agent not allowed");
+    }
+
+    #[tokio::test]
+    async fn route_validators_receive_the_utf8_request_body() {
+        let seen: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        let validator: guard_core_engine::custom_checks::CustomValidatorFn = Arc::new(move |ctx| {
+            *sink.lock().expect("sink") = ctx.body.map(str::to_owned);
+            None
+        });
+        let config = RouteConfig {
+            custom_validators: vec![validator],
+            ..RouteConfig::default()
+        };
+        let layer = GuardLayer::new(default_config())
+            .with_route_configs(resolver_for(&[("POST", "/api")], config));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api")
+            .extension(GuardClientIp(
+                IpAddr::from_str("192.0.2.9").expect("address"),
+            ))
+            .body(Full::new(Bytes::from_static(b"hello")))
+            .expect("request");
+        let (status, _) = status_and_body(&layer, request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seen.lock().expect("sink").as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn a_preflight_header_the_response_cannot_carry_is_dropped() {
+        let layer = GuardLayer::from_security_config(&SecurityConfig {
+            enable_cors: true,
+            cors_allow_origins: vec!["https://app.example.com".to_owned()],
+            cors_allow_methods: vec!["POST".to_owned(), "X\nY".to_owned()],
+            ..SecurityConfig::default()
+        })
+        .expect("valid config");
+        let preflight = http::Request::builder()
+            .method("OPTIONS")
+            .uri("/api")
+            .header("Origin", "https://app.example.com")
+            .header("Access-Control-Request-Method", "POST")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = guarded(&layer).oneshot(preflight).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("Access-Control-Allow-Methods")
+                .is_none()
+        );
+        assert!(
+            response
+                .headers()
+                .get("Access-Control-Allow-Origin")
+                .is_some()
+        );
     }
 
     #[tokio::test]
